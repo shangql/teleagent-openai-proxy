@@ -1331,6 +1331,16 @@ def _build_tool_prompt(tools):
     )
 
 
+# 复用会话时替代完整工具清单的极简约定。
+# 完整清单（含每个工具的 JSON schema）已在会话历史里，每轮重发只会让
+# TeleAgent 的消息变成一堵墙，并白白抬高上下文。
+_TOOL_FORMAT_REMINDER = (
+    "继续使用本会话此前已给出的工具清单与调用格式："
+    "需要调用工具时，回复只包含 [TOOL_CALL]{\"name\": \"工具名称\", \"arguments\": {...}}[/TOOL_CALL]，"
+    "不要输出任何其他文字；不需要调用工具时正常回复即可。"
+)
+
+
 def _parse_tool_calls_from_text(text):
     """从 LLM 回复文本中解析 [TOOL_CALL]...[/TOOL_CALL] 标记。
     返回 (clean_text, tool_calls) 其中 tool_calls 为 OpenAI Chat Completions 格式。
@@ -1702,22 +1712,30 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
     if session_reused and len(user_messages) > 1:
         user_messages = [user_messages[-1]]
 
-    # 构建最终 prompt 文本
-    # 如果只有一条 user 消息且无 system，直接用内容
-    if len(user_messages) == 1 and not system_content:
-        prompt_text = user_messages[0]
-    else:
-        # 多轮对话：格式化为对话历史
-        parts = []
-        if system_content:
-            parts.append(system_content)
-        for msg in user_messages:
-            parts.append(msg)
-        prompt_text = "\n\n".join(parts)
+    # 复用会话时，完整 system 提示词与工具清单已存在于该会话的历史消息中，
+    # 不再每轮重发。实测单条重发量约 6 万字符（dsh 的系统提示 + 47 个工具的
+    # JSON schema），带来两个实际后果：
+    #   1) TeleAgent 里每条 user 消息都变成一堵 6 万字的墙，真实提问被埋在
+    #      最后几十个字符里，人根本找不到（「看不到 dsh 请求的内容」）；
+    #   2) 每轮上下文白白膨胀，上游生成明显变慢。
+    # 复用时只保留一条精简的调用格式约定，避免模型忘记 [TOOL_CALL] 语法。
+    if session_reused:
+        system_content = _TOOL_FORMAT_REMINDER if tools else None
+
+    # 换成多个 text part 下发：system 提示词与用户提问各自成一个 part。
+    # TeleAgent 会把多个 part 原样保留（实测 parts 数量与下发一致），
+    # 界面上因此能分开显示——否则 system 与提问拼成一大段，提问被埋掉。
+    parts_payload = []
+    if system_content:
+        parts_payload.append({"type": "text", "text": system_content})
+    for msg in user_messages:
+        parts_payload.append({"type": "text", "text": msg})
+    if not parts_payload:
+        parts_payload.append({"type": "text", "text": ""})
 
     body = {
         "sessionID": session_id,
-        "parts": [{"type": "text", "text": prompt_text}],
+        "parts": parts_payload,
     }
     if directory:
         body["directory"] = directory

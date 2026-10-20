@@ -14,6 +14,24 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.16.0] - 2026-10-21
+
+### 修复
+
+- **TeleAgent 里看不到 dsh 的请求内容**：`send_prompt_async` 每轮都把完整的 system 提示词拼进同一条 user 消息，实测单条约 **6 万字符**（dsh 系统提示 + 47 个工具的 JSON schema）——真实提问被埋在最后几十个字符里，人在 TeleAgent 里翻不到
+  - 更严重的是会触发 TeleAgent 的**历史压缩**：会话累积 40 多条这样的消息后，出现 `compaction` part，原始提问被摘要取代，此后再也看不到具体请求
+  - **改为多个 text part 下发**：system 提示词与用户提问各成一个 part。实测 TeleAgent 会原样保留 parts 数量（下发 2 个就落库 2 个），界面因此能分开显示
+  - **复用会话时不再重发完整 system 提示词**：它已存在于该会话的历史消息中（实测会话上下文本来就包含它，输入 token 计数可证）。复用时只发一条约 120 字的工具调用格式约定，避免模型忘记 `[TOOL_CALL]` 语法
+  - 实测效果：单条消息从 **60 397 字符**降到 **1 142 字符**；标题生成调用从 611 降到 99；工具调用仍正确（`finish_reason=tool_calls`，`tool_calls` delta 完整，标记无泄漏）；dsh 端到端 9.8s 通过
+
+### 新增
+
+- **会话复位提示**：若某个会话已被压缩、内容丢失，在 TeleAgent 里删除该会话即可——代理按标题复用，会话不存在时会自动新建一个干净的
+
+### 变更
+
+- `VERSION` 同步至 1.16.0
+
 ## [1.15.0] - 2026-10-21
 
 ### 新增
