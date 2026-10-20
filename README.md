@@ -13,41 +13,64 @@ AIGC:
 
 将 [TeleAgent](https://teleagent.cn) 桌面应用的 super-agent API 转换为 **OpenAI 兼容接口**，任何支持 OpenAI API 的工具/SDK 均可直接接入。
 
+## 平台支持
+
+| 平台 | 状态 | session key 获取方式 | 持久化方式 |
+|------|------|--------------------|-----------|
+| macOS | ✅ 官方支持 | `pgrep` + `ps eww` 读进程环境 | launchd |
+| Windows | ✅ 已适配（v1.10.0+） | 读取 TeleAgent 进程 PEB 环境块 | 任务计划程序 |
+
+两个平台的 HTTP / HMAC / SSE 逻辑完全一致，Windows 侧纯标准库实现，**无需管理员权限、无需额外安装 Python**。
+
 ## 特性
 
 - **OpenAI 兼容**：标准 `/v1/chat/completions` 和 `/v1/models` 端点
 - **流式 & 非流式**：支持 SSE 流式输出和一次性返回
 - **多轮对话**：通过 messages 数组传入完整历史
-- **自动签名**：自动从运行中的 scheduler 进程获取 session key
+- **自动签名**：自动从运行中的 TeleAgent 进程获取 session key
 - **模型管理**：只展示 TeleAgent 中已配置成功的 Provider 与模型（未配置密钥的内置模型目录自动隐藏），TeleAgent 新增配置后面板每 30 秒自动同步
 - **默认模型可切换**：Web 控制台可动态修改默认模型，立即生效，影响所有未显式指定 `model` 的 API 请求
 - **Web 控制台**：内置仪表盘、模型管理、请求日志、在线测试、会话管理
-- **持久化运行**：通过 macOS launchd 开机自启、崩溃自动重启
+- **持久化运行**：macOS 用 launchd、Windows 用任务计划程序，均支持开机自启、崩溃自动重启
 - **零依赖**：纯 Python 标准库实现，无需 pip install
 
 ## 快速开始
 
 ### 前置条件
 
-- macOS（依赖 TeleAgent 桌面应用运行中的 super-agent）
-- Python 3.8+（推荐 [Homebrew Python 3.11](https://brew.sh)，具备完整 TCC 权限）
+**通用**
+
+- **TeleAgent 桌面应用必须已启动**——其内置的 super-agent 服务监听 `127.0.0.1:4397`，代理需要与它通信才能完成签名与转发；未启动时代理会在启动阶段直接报错退出
+- **Python 3.8+**
+
+**macOS**
+
+- 推荐 [Homebrew Python 3.11](https://brew.sh)，具备完整 TCC 权限
 
 > **TCC 权限提示**：macOS 的 `~/Desktop`、`~/Documents`、`~/Downloads` 受 TCC 隐私保护。通过 `launchd` 持久化运行的服务需要使用已获得 TCC 授权的 Python 解释器（如 Homebrew 安装的 Python 3.11+），否则会遇到 `Operation not permitted` 错误。如果脚本放在 `/tmp` 或 `~/scripts` 等非受保护目录，则无此限制。
 
-> **Windows 说明**：Windows 已适配可用。`session key` 的获取方式在两个平台上不同——macOS 用 `pgrep` + `ps eww` 读进程环境，Windows 没有等价命令，改为直接读取 TeleAgent 子进程的 PEB 环境块（纯标准库 ctypes 实现，无需管理员权限）。其余 HTTP / HMAC / SSE 逻辑完全一致。详见下方「Windows 启动」。
+**Windows**
+
+- **不需要管理员权限**，**不需要额外安装 Python**——TeleAgent 桌面应用自带 Python 3.12 运行时（`%USERPROFILE%\.local\share\TeleAgent\runtimes\python\python.exe`），`start_proxy.cmd` 会优先使用它
+- 也可使用系统 Python 3.8+（需在 PATH 中）
+- session key 的获取方式与 macOS 不同：macOS 用 `pgrep` + `ps eww` 读进程环境，Windows 没有等价命令，改为直接读取 TeleAgent 子进程的 PEB 环境块（纯标准库 ctypes 实现）。详见下方「Windows 专项说明」
 
 ### 启动代理
+
+macOS / Linux：
 
 ```bash
 python3 openai_proxy.py --port 8088 --host 0.0.0.0
 ```
 
-### Windows 启动
+Windows：
 
 ```bat
-:: 双击或命令行执行，会自动挑选可用的 Python 解释器
+:: 自动挑选可用的 Python 解释器（优先 TeleAgent 自带运行时）
 start_proxy.cmd
 ```
+
+### Windows 专项说明
 
 手动指定解释器与监听地址：
 
@@ -56,7 +79,7 @@ start_proxy.cmd
 "%USERPROFILE%\.local\share\TeleAgent\runtimes\python\python.exe" openai_proxy.py --host 127.0.0.1 --port 8088
 ```
 
-Windows 上的注意事项：
+注意事项：
 
 - **监听地址**：建议用 `--host 127.0.0.1`。代理**不校验 API Key**，用 `0.0.0.0` 会把本机 TeleAgent 的调用能力暴露给整个局域网。
 - **前置依赖**：TeleAgent 桌面应用必须已启动（super-agent 监听 `127.0.0.1:4397`），否则拿不到 session key，代理会在启动阶段直接报错退出。
@@ -211,9 +234,11 @@ launchctl load ~/Library/LaunchAgents/com.lizhun.openai-proxy.plist
 
 ### 签名机制
 
-代理自动从 scheduler 进程环境变量中提取 `SUPER_AGENT_LOCAL_SESSION_KEY`，使用 HMAC-SHA256 + base64url 生成签名头：
+代理自动从运行中的 TeleAgent 进程环境变量中提取 `SUPER_AGENT_LOCAL_SESSION_KEY`，使用 HMAC-SHA256 + base64url 生成签名头：
 
-> macOS 通过 `pgrep` + `ps eww` 读取进程环境；Windows 改为遍历 `node.exe` / `TeleAgent.exe` 并直接读取目标进程的 PEB 环境块（`NtQueryInformationProcess` + `ReadProcessMemory`，纯 ctypes 标准库实现，无需管理员权限）。
+> - **macOS**：通过 `pgrep` + `ps eww` 读取进程环境
+> - **Windows**：改为遍历 `node.exe` / `TeleAgent.exe` 并直接读取目标进程的 PEB 环境块（`NtQueryInformationProcess` + `ReadProcessMemory`，纯 ctypes 标准库实现，无需管理员权限）
+>   - 注意：scheduler 启动后会在 JS 层 `delete process.env[SUPER_AGENT_LOCAL_SESSION_KEY]`，该操作在 Windows 上会真正 unset 掉 PEB 环境块中的变量（macOS 的 `ps eww` 读的是启动时快照，不受影响），因此 Windows 上 key 实际由 **im-service 进程**持有。实现按「扫描所有候选进程」而非硬编码 PID，TeleAgent 升级后仍可自适应
 
 ```
 payload = "\n".join(["local-v1", method, path_with_query, timestamp_ms, nonce])
@@ -242,6 +267,7 @@ signature = HMAC-SHA256(session_key, payload).digest("base64url")
 ## 技术细节
 
 - **零依赖**：纯 Python 标准库（`http.server`, `hmac`, `json`, `threading`），无第三方包
+- **跨平台**：macOS 与 Windows 共用同一份业务代码；平台差异集中在 session key 提取与调用方反查两处（Windows 分支基于 `ctypes`）
 - **线程安全**：每个请求独立线程处理，SSE 监听器在子线程运行
 - **会话隔离**：每次 API 请求创建独立的 super-agent 会话
 - **日志环形缓冲**：保留最近 200 条请求日志

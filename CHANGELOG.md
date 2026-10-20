@@ -25,7 +25,7 @@ AIGC:
   - **调用方反查**：新增 `netstat -ano` 版实现替代 macOS 的 `lsof -i :8088`；配套 `_win_process_command_line()`（`ProcessCommandLineInformation`）取目标进程完整命令行
   - **启动脚本**：`start_proxy.cmd`——自动挑选可用解释器（优先 TeleAgent 自带 Python 3.12 运行时，其次系统 PATH 上的 python），启动前检查 4397 端口是否有 super-agent 在监听；文件为纯 ASCII，兼容任意 Windows 控制台代码页
   - **持久化**：`install-scheduled-task.ps1`——用「任务计划程序」替代 launchd plist（用户登录时自启 + 失败自动重启），支持 `-Uninstall` 卸载
-  - **README**：新增「Windows 启动」「持久化运行（Windows 任务计划程序）」章节，签名机制章节补充 Windows 取 key 的实现说明
+  - **README**：新增「平台支持」对照表（macOS / Windows 的 key 获取方式与持久化方式）、按平台拆分的「前置条件」与「启动代理」命令、「Windows 专项说明」与「持久化运行（Windows 任务计划程序）」章节；签名机制章节补充 Windows 取 key 的实现说明与 im-service 进程持有 key 的原因
 - **多平台静态常量**：`PLATFORM_LABEL` / `SESSION_KEY_SOURCE_LABEL`，控制台「运行平台」「Session Key 来源」按平台动态渲染，不再硬编码 macOS 文案
 
 ### 修复
