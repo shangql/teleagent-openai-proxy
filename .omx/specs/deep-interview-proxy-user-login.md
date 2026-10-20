@@ -15,6 +15,24 @@
 
 ---
 
+## 0. 规格修订说明（后续链路回写，2026-10-20 22:47）
+
+本规格在下游链路中被修订/取代的地方，以**下游产物为准**，此处只做指向，避免读者按过期描述实施：
+
+| 位置 | 原描述 | 修订后 | 依据 |
+| --- | --- | --- | --- |
+| §4 范围内 **S3** | 引导流程"自动建 admin + 随机口令**打印一次**" | **服务永不生成/打印口令**；口令由运维用 CLI 显式设置（`python user_auth.py --init-admin admin` / `--set-password`）；无账号时代理处于**自举态**（不强制登录） | Architect r1 **V-1**：计划任务把 stdout 重定向到 `proxy.out.log`（`install-scheduled-task.ps1:62-63`），"打印口令"= 明文落盘，违反原则 P3。已由 PRD v2 §4 取代 |
+| §5 范围外 | "JWT（方案层否决）" | 保持否决，但**否决理由重排**：主因=零依赖下不手写 HS256；撤销降为加分项 | Architect r1 **S-1**；PRD v2 §0 |
+| §8 验收 | AC-1..AC-12 | 扩充为 **AC-1..AC-16**（新增：非本机来源 401、运行期回退、CSRF 防护、登录日志白名单） | Critic r1 **C-1/C-2/C-5**、Architect r1 **T-1/V-2**；PRD v2 §9 |
+| §8 验收 AC-13 | 无对应用例、不可构造 | 抽 `_decide_auth(path, client_ip, …)` 纯函数 + 注入 client IP 单测 | Critic r1 **C-1** |
+
+**并行提交的出现**：本规格产出后，仓库出现并行写入者提交的另一套实现（commit `29354cf` API Key 三档鉴权、commit `7f12439` 用户登录鉴权基座 + `docs/adr-0001-user-login-auth-scheme.md` / `docs/user-login-api-contract.md` / `docs/user-login-plan.md`）。经对比：
+
+- **结论一致**：鉴权方案同为「服务端会话 + Cookie（非 JWT）」、只保护管理面、`/v1/*` 不变、双角色、不做邮件找回 —— 构成一次**独立交叉验证**；
+- **实现更完整且已合入**：故以其为基座，本会话停止与其区域重叠的写入（详见 `.omx/team/user-login/report.md` §3）。
+
+---
+
 ## 1. 清晰度分解表（brownfield 权重）
 
 | 维度 | 权重 | 初值(R0) | 终值 | 提升来源 |
