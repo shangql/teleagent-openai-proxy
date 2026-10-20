@@ -1,0 +1,40 @@
+{
+  "ralplan_execution_handoff": {
+    "authorized": true,
+    "reason": "ralplan --deliberate 完成：Planner v2 → Architect r1(REVISE) → Critic r1(ITERATE) → PRD/测试规格 v2 修订 → Architect r2(PASS) → Critic r2(APPROVE)。第 2 轮复审逐条销项 r1 的 5 条阻断 + 1 条需补，无新增阻断。",
+    "authorized_at": "2026-10-20T14:23:57Z",
+    "session_id": "mvs_ad53aa8652f245e3af59e6832af39992",
+    "review_cycle": 2,
+    "source": {
+      "slug": "proxy-user-login",
+      "context": ".omx/context/proxy-user-login-20261020T142357Z.md",
+      "interview": ".omx/interviews/proxy-user-login-20261020T142357Z.md",
+      "spec": ".omx/specs/deep-interview-proxy-user-login.md",
+      "prd": ".omx/plans/prd-proxy-user-login.md",
+      "test_spec": ".omx/plans/test-spec-proxy-user-login.md",
+      "reviews": [
+        ".omx/plans/reviews/proxy-user-login-architect-r1.md",
+        ".omx/plans/reviews/proxy-user-login-critic-r1.md",
+        ".omx/plans/reviews/proxy-user-login-architect-r2.md",
+        ".omx/plans/reviews/proxy-user-login-critic-r2.md"
+      ]
+    },
+    "plan_status": "complete",
+    "execution_target": "team (3 lanes, 并行)",
+    "clarification_state": "PARTIALLY_CLARIFIED_BRIEF — 数值歧义 0.143 ≤ 0.20，但就绪门第 3 项(人的判断)未满足；规格基于证据推导的默认，未获用户确认",
+    "residual_risks": [
+      "ODL-1 用户定义(人 vs 程序)未确认——默认按『控制台人类』实现",
+      "ODL-2 JWT vs session 未确认——默认 session(JWT 否决理由见 PRD §0)",
+      "ODL-3 是否多用户/角色未确认——默认支持多用户，角色仅 admin/viewer",
+      "ODL-4 是否按用户计量未确认——默认不做，进 v2 backlog",
+      "ODL-5 密码找回路径未确认——默认 CLI --set-password",
+      "ODL-6 是否收紧 /api/* 本机免鉴权未确认——默认保留(机器人依赖)",
+      "ODL-7 会话是否跨重启未确认——默认不保留(纯内存)",
+      "ODL-8 是否收窄监听地址未确认——默认不改线上参数，仅在发布清单提示",
+      "评审独立性未达成：本环境无 task/verifier 子智能体，Architect 与 Critic 由同一执行体分角色完成，不得对外宣称『经独立第三方评审通过』",
+      "线上实例 PID 26124 重启属显式动作，需用户拍板时机"
+    ],
+    "acceptance_refs": "AC-1 .. AC-16（PRD §9），退出判据见测试规格 §4",
+    "deployment_note": "本项目无云发布载体；『上线』= git 合入 main + 本机服务(计划任务/手工进程)跑到新代码。测试一律走副本目录 + 随机高位端口，不得触碰线上 8088。"
+  }
+}

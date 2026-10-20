@@ -1,0 +1,125 @@
+{
+  "team": "user-login",
+  "slug": "proxy-user-login",
+  "updated_at": "2026-10-20T14:45:00Z",
+  "session_id": "mvs_ad53aa8652f245e3af59e6832af39992",
+  "chain": "deep-interview -> ralplan --deliberate -> team -> (merge/release pending user go-ahead)",
+  "overall": "partially_complete",
+  "lanes": [
+    {
+      "id": "A",
+      "name": "auth-user-store / 后端接线",
+      "owner": "负责人 1",
+      "exclusive_paths": [
+        "user_auth.py (加固，签名冻结)",
+        "openai_proxy.py :: import 区 / _auth_check / do_GET / do_POST / 新增 handler"
+      ],
+      "state": "base_merged",
+      "delivered": [
+        "user_auth.py (757 行, commit 7f12439)",
+        "tests/test_user_auth.py (37 条单测, commit 7f12439)",
+        "docs/adr-0001-user-login-auth-scheme.md",
+        "docs/user-login-api-contract.md",
+        "docs/user-login-plan.md"
+      ],
+      "pending": [
+        "openai_proxy.py 的 5 处接线与 5 个 handler (契约 §5)"
+      ],
+      "blocked_by": null
+    },
+    {
+      "id": "B",
+      "name": "auth-session-guard / 控制台前端",
+      "owner": "负责人 2",
+      "exclusive_paths": [
+        "openai_proxy.py :: CONSOLE_HTML 常量 (仅此一处)"
+      ],
+      "state": "pending",
+      "delivered": [],
+      "pending": [
+        "登录遮罩 / apiFetch 包装 (CSRF + 401) / 用户菜单 / 账号管理页 / 模式切换 UI"
+      ],
+      "blocked_by": "A 的端点形状 (契约已冻结，可用 mock 先行)"
+    },
+    {
+      "id": "C",
+      "name": "测试 · CLI · 文档",
+      "owner": "负责人 3",
+      "exclusive_paths": [
+        "tests/test_user_auth.py",
+        "tests/test_login_api.py",
+        "openai_proxy_manager.py",
+        "README.md",
+        "CHANGELOG.md",
+        "scripts/enable_login.ps1",
+        "scripts/rollback_login.ps1"
+      ],
+      "state": "pending",
+      "delivered": [],
+      "pending": [
+        "契约级集成测试 / manager CLI 兼容 / 文档 / 上下线脚本"
+      ],
+      "blocked_by": "无（可第一天开工）"
+    }
+  ],
+  "collision": {
+    "detected_at": "2026-10-20T14:34:00Z",
+    "type": "concurrent_writer + ownership_overlap",
+    "detail": "并行写入者在同一工作区提交了同一功能的另一套实现：commit 29354cf (API Key 三档鉴权) 与 commit 7f12439 (user_auth.py + 契约 + 三泳道计划)。其归属表把 openai_proxy.py 切为「路由区=A / CONSOLE_HTML=B」，与本会话 lanes.md 的「Lane C 独占整个 openai_proxy.py」直接冲突。",
+    "evidence": [
+      "git log: 7f12439 feat(v1.12.0): 用户登录鉴权基座 + 三泳道实施计划",
+      "docs/user-login-api-contract.md §6 文件与区域归属（防冲突表）",
+      "docs/user-login-plan.md §3 三条并行泳道",
+      "openai_proxy.py 中 user_auth 引用数 = 0（其接线尚未开始）"
+    ],
+    "resolution": "采纳并行提交为基座（更完整、已合入、37 单测通过），本会话停止所有与其区域重叠的写入；本会话的重复实现已可恢复删除；两套 lane 划分合并为区域级互斥的计划，见 consolidated-lanes.md。",
+    "files_removed_by_this_session": [
+      "auth_users.py",
+      "auth_session.py",
+      "tests/test_auth_users.py",
+      "tests/test_auth_session.py"
+    ],
+    "files_modified_by_other_writer": "无（未改动 user_auth.py / tests/test_user_auth.py / docs/* / openai_proxy.py）"
+  },
+  "verification": {
+    "harness": ".omx/team/user-login/verify_base.ps1",
+    "last_run": "2026-10-20T14:44:00Z",
+    "result": "total 11 | PASS 9 | PENDING 2 | FAIL 0",
+    "checks": [
+      { "id": "T1", "name": "py_compile openai_proxy.py user_auth.py", "state": "PASS" },
+      { "id": "T2", "name": "unittest discover -s tests", "state": "PASS", "detail": "Ran 37 tests, OK" },
+      { "id": "T3", "name": "密钥文件未被 git 跟踪 (auth.json / users.json 已 gitignore)", "state": "PASS" },
+      { "id": "T4", "name": "副本实例在备用端口 18089 就绪", "state": "PASS" },
+      { "id": "T5", "name": "GET /health", "state": "PASS", "detail": "200" },
+      { "id": "T6", "name": "GET /v1/models（数据面未受影响）", "state": "PASS", "detail": "200" },
+      { "id": "T7", "name": "GET /api/status（本机免鉴权保留）", "state": "PASS", "detail": "200" },
+      { "id": "T8", "name": "GET /console", "state": "PASS", "detail": "200" },
+      { "id": "T9", "name": "GET /api/auth/me", "state": "PENDING", "detail": "404 —— 泳道 A 尚未接线" },
+      { "id": "T10", "name": "POST /api/auth/login", "state": "PENDING", "detail": "404 —— 泳道 A 尚未接线" },
+      { "id": "T11", "name": "线上实例未被测试打断", "state": "PASS", "detail": "PID 25756 保持不变" }
+    ]
+  },
+  "deployment_facts": [
+    "同时有两个实例监听 8088：PID 25756 (127.0.0.1, 计划任务拉起) 与 PID 26124 (0.0.0.0, 局域网可达) —— 重启必须指名道姓",
+    "计划任务 TeleAgent OpenAI Proxy 状态 Ready，runner 指向本仓库 openai_proxy.py --host 127.0.0.1 --port 8088 → 重启任务即等于上线",
+    "回滚 = python user_auth.py --set-mode off（分钟级，无需重启）",
+    "本会话未重启/未终止任何线上实例"
+  ],
+  "open_decisions": [
+    "ODL-1 用户定义（人 vs 程序）", "ODL-2 JWT vs session", "ODL-3 是否多用户/角色",
+    "ODL-4 是否按用户计量", "ODL-5 密码找回路径", "ODL-6 是否收紧 /api/* 本机免鉴权",
+    "ODL-7 会话是否跨重启", "ODL-8 是否收窄监听地址（双实例事实使其升级为必答项）"
+  ],
+  "blocked": [
+    {
+      "what": "泳道 A/B/C 的实际编码",
+      "why": "区域归属已被并行提交占用；本会话按合同不修改他人拥有的文件",
+      "smallest_question": "A/B/C 三条泳道是否由其他执行体承担？若否，请指定由谁认领 A（openai_proxy.py 路由区），本会话可接手该区域"
+    },
+    {
+      "what": "线上实例重启（真正的『上线』动作）",
+      "why": "会打断在途请求，且当前有 0.0.0.0 与 127.0.0.1 两个实例，需用户决定停哪个",
+      "smallest_question": "是否现在重启线上实例？若重启，请确认：① 是否同时停掉 PID 26124（0.0.0.0）② 监听地址是否收窄到 127.0.0.1"
+    }
+  ]
+}

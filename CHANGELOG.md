@@ -14,6 +14,31 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.12.0] - 2026-10-20
+
+### 新增
+
+- **用户登录鉴权基座**（`user_auth.py`）：在 API Key 认证之外补齐「人访问控制台」这一层。纯标准库实现，零第三方依赖，且**不 import `openai_proxy.py`**，可被单元测试直接驱动
+  - **账号库**：`users.json`（与 `auth.json` 同目录，运行期生成，禁止入库），基于 JSON 文件 + 原子写（先写临时文件再 `os.replace`）+ 线程锁
+  - **口令存储**：PBKDF2-HMAC-SHA256，210,000 次迭代、随机盐、哈希串自描述（算法与迭代次数随哈希一并保存，便于后续提升迭代次数）。口令策略只约束长度（10–256），不做字符集规则
+  - **登录会话**：`tap_sid` Cookie，8 小时有效期、滑动续期、每用户最多 5 个会话；**会话不落盘**，重启后需重新登录（更安全的默认）
+  - **角色**：`admin` / `viewer`；用户状态 `enabled` / `disabled`，停用账号会连带吊销其既有会话
+  - **登录模式三档**：`off`（默认，保持现网行为）/ `optional`（校验登录但本机来源 `127.0.0.1` 仍放行，便于灰度与回滚）/ `required`（全量强制登录）
+  - **登录失败限流**：按「用户名 + 来源 IP」统计，5 次 / 300 秒窗口触发后锁定 60 秒
+  - **CSRF**：双提交校验，请求头 `X-CSRF-Token` 必须与会话中的令牌一致
+  - **防用户名枚举**：未知用户与错误口令返回同一提示
+  - **统一错误码**：`invalid_credentials` / `locked_out` / `user_disabled` / `weak_password` / `invalid_username` / `user_exists` / `user_not_found` / `invalid_mode`
+  - **命令行管理**：`--init-admin` / `--create-user` / `--role` / `--set-password` / `--disable-user` / `--enable-user` / `--delete-user` / `--list-users` / `--set-mode` / `--password-stdin`
+- **单元测试**（`tests/test_user_auth.py`）：标准库 `unittest`，37 个用例覆盖口令哈希、账号库 CRUD、登录、会话生命周期、HTTP helper 与 CLI，全部通过（`python -m unittest discover -s tests -v`）
+- **设计与实施文档**：`docs/adr-0001-user-login-auth-scheme.md`（架构决策记录）、`docs/user-login-api-contract.md`（前后端接口契约）、`docs/user-login-plan.md`（实施计划）
+- **实施计划留档**（`.omx/`）：深访规格、PRD、测试规格、Architect/Critic 两轮评审记录、三泳道分工与基线验证脚本
+
+### 变更
+
+- `VERSION` 同步至 1.12.0，`.gitignore` 增加 `users.json`
+
+> 本版交付的是**鉴权基座**，尚未接入 `openai_proxy.py` 的路由层——`AuthManager` 已提供 `login` / `logout` / `authenticate` / `set_mode` 等门面方法，路由接入由后续泳道完成。
+
 ## [1.11.0] - 2026-10-20
 
 ### 新增
