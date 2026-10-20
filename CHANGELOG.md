@@ -14,6 +14,29 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.17.0] - 2026-10-21
+
+### 新增
+
+- **推理过程转发（`reasoning_content`）**：此前只转发正文，模型思考的那十几秒客户端完全空白——「dsh 发一句话就是干等」。上游其实一直在推 reasoning 增量，只是流式转发器按 partID 把它当成非正文丢掉了
+  - 上游形态是 `message.part.delta` + `field: "text"`，靠 partID 是否属于 assistant 的 text part 区分；基类 `SSEListener` 早就分开了，流式转发器补上 `on_reasoning` 回调
+  - 以 OpenAI 兼容字段 `reasoning_content` 下发，`message.part.updated` 的 `reasoning` 整块作兜底；不认该字段的客户端直接忽略，不影响正文
+  - 推理与正文各用一个独立的打字机节拍器，互不干扰节奏计数
+  - 实测（干净会话）：**首推理 2.08–2.29s vs 首正文 4.90–7.28s**，空白等待缩短 3–5 秒；dsh 把它渲染成 `type: "thinking"` 事件
+
+- **原生工具进度播报**：super-agent 会用自己的原生工具（`read` / `grep` / `pwsh` / `todo` …）干活，这些操作此前对客户端完全不可见
+  - 监听 `message.part.updated` 的 `tool` part，按 `(partID, status)` 去重，把 `running` / `completed` 两种状态播报进推理流
+  - 格式：`[工具] read ← 路径`（开始）、`[工具] read ✓ 路径`（完成），路径取 `state.title`，缺失时回退到入参里的 `path`/`filePath`/`pattern`/`command`/`query`
+  - 进度行**不走**打字机节拍器：短行会被切碎、标记被切断，且进度有时效性
+
+- **dsh 内部辅助请求分流**：dsh 每轮会**并发**发出「生成会话标题」「采样时间」这类内部请求，与真实对话共用同一会话时有两个实际危害——两路 assistant 增量同时进同一监听器，正文与推理交错成乱码；主会话被无用消息灌满，加速 TeleAgent 的历史压缩
+  - 识别 3 类前缀（`create a concise title` / `generate the session title` / `time sampled while preparing turn`），分流到 `<原标题>-内部辅助` 会话
+  - 实测生效：会话列表中出现独立的 `外部|Node服务|星小辰-子智能体-内部辅助`
+
+### 变更
+
+- `VERSION` 同步至 1.17.0
+
 ## [1.16.0] - 2026-10-21
 
 ### 修复

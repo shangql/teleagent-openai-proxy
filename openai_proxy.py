@@ -1341,6 +1341,21 @@ _TOOL_FORMAT_REMINDER = (
 )
 
 
+def _short_input(tool_input, limit=80):
+    """把工具入参压成一行可读摘要，用于推理流里的进度播报。"""
+    if not tool_input:
+        return ""
+    try:
+        if isinstance(tool_input, dict):
+            for key in ("path", "filePath", "pattern", "command", "query"):
+                if tool_input.get(key):
+                    return str(tool_input[key])[:limit]
+            return json.dumps(tool_input, ensure_ascii=False)[:limit]
+        return str(tool_input)[:limit]
+    except Exception:
+        return ""
+
+
 def _parse_tool_calls_from_text(text):
     """从 LLM 回复文本中解析 [TOOL_CALL]...[/TOOL_CALL] 标记。
     返回 (clean_text, tool_calls) 其中 tool_calls 为 OpenAI Chat Completions 格式。
@@ -2328,14 +2343,24 @@ def start_global_confirmation_listener():
 # 流式 SSE 监听器（用于流式转发）
 # ============================================================
 class StreamingSSEListener(SSEListener):
-    """监听 SSE 并实时回调文本增量"""
+    """监听 SSE 并实时回调文本增量
 
-    def __init__(self, session_id, on_delta, on_complete, on_error, timeout=120):
+    on_reasoning: 推理过程增量回调。上游把 reasoning 的增量也发成
+    `message.part.delta` + `field: "text"`，只是 partID 不属于 assistant 的
+    text part；基类已经按 partID 把两者分开，这里补上转发。
+    """
+
+    def __init__(self, session_id, on_delta, on_complete, on_error, timeout=120,
+                 on_reasoning=None, on_tool=None):
         super().__init__(session_id, timeout)
         self.on_delta = on_delta
         self.on_complete = on_complete
         self.on_error = on_error
+        self.on_reasoning = on_reasoning
+        self.on_tool = on_tool
         self._text_started = False
+        self._reasoning_started = False
+        self._tool_seen = set()   # (partID, status) 去重，避免重复播报
 
     def _handle_event(self, event):
         payload = event.get("payload", {})
@@ -2376,6 +2401,25 @@ class StreamingSSEListener(SSEListener):
                     self.on_delta(text)
                     self._text_started = True
 
+            # 推理过程：整块兜底（正常情况下 deltas 已经逐块转发了）
+            if part_type == "reasoning" and text and msg_id in self._assistant_msg_ids:
+                if not self._reasoning_started and self.on_reasoning:
+                    self.reasoning_chunks.append(text)
+                    self.on_reasoning(text)
+                    self._reasoning_started = True
+
+            # 原生工具调用：super-agent 自己执行工具（read/grep/pwsh…），
+            # 这些操作对客户端完全不可见。转发出去，客户端才能看到进度。
+            if part_type == "tool" and self.on_tool:
+                state = part.get("state") or {}
+                status = state.get("status") or ""
+                if status in ("running", "completed"):
+                    key = (part_id, status)
+                    if key not in self._tool_seen:
+                        self._tool_seen.add(key)
+                        self.on_tool(part.get("tool") or "", state.get("title") or "",
+                                     status, state.get("input"), state.get("output"))
+
             if part_type == "step-finish":
                 self.tokens = part.get("tokens", {})
 
@@ -2394,6 +2438,11 @@ class StreamingSSEListener(SSEListener):
                     self._text_started = True
                     self.text_chunks.append(delta)
                     self.on_delta(delta)
+                elif self.on_reasoning:
+                    # 不属于 text part 的 text 增量 = 推理过程
+                    self._reasoning_started = True
+                    self.reasoning_chunks.append(delta)
+                    self.on_reasoning(delta)
 
         elif etype == "session.status":
             status = props.get("status", {})
@@ -3188,6 +3237,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         user_agent = self.headers.get("User-Agent", "")
         # 读取自定义会话标题（机器人可传"姓名 | 技能 | 时间"）
         raw_session_title = req_data.get("session_title") or "星小辰-子智能体"
+
+        # ===== dsh 等客户端的内部辅助请求分流 =====
+        # dsh 每轮会**并发**发出「生成会话标题」「采样时间」这类内部请求，与
+        # 真实对话共用同一会话时会有两个实际危害：
+        #   1) 串流：两路 assistant 的增量同时进同一个监听器，正文与推理交错
+        #      成乱码（实测英文推理里夹着中文片段）；
+        #   2) 污染：主会话被大量无用消息灌满，加速 TeleAgent 的历史压缩，
+        #      压缩后原始提问会被摘要取代。
+        # 这里把它们分流到独立的辅助会话，主会话只留真实对话。
+        _AUX_PROMPT_PREFIXES = (
+            "create a concise title",
+            "generate the session title",
+            "time sampled while preparing turn",
+        )
+        if prompt_preview and prompt_preview.lstrip().lower().startswith(_AUX_PROMPT_PREFIXES):
+            raw_session_title = raw_session_title + "-内部辅助"
+
         # 识别业务渠道来源：企微/QQ/量子密信/面板测试/TeleAgent主程序/外部脚本/机器人预热
         source_tag = "外部"
         source_detail = ""
@@ -3350,6 +3416,31 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 }
                 self._send_sse_chunk(chunk)
 
+        def _emit_reasoning(text):
+            """发送推理过程 delta（OpenAI 兼容的 reasoning_content 字段）。
+
+            转发推理有两个实际作用：一是等待首个正文 token 的那几秒不再是
+            空白（模型往往先思考十几秒）；二是客户端能显示「深度思考」过程。
+            不认识该字段的客户端会直接忽略，不会影响正文解析。
+            """
+            nonlocal first_chunk_sent
+            if not text:
+                return
+            if not first_chunk_sent:
+                first_chunk = {
+                    "id": request_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+                }
+                self._send_sse_chunk(first_chunk)
+                first_chunk_sent = True
+            chunk = {
+                "id": request_id, "object": "chat.completion.chunk",
+                "created": created, "model": model_name,
+                "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}]
+            }
+            self._send_sse_chunk(chunk)
+
         def _emit_tool_calls(tool_calls):
             """发送 tool_calls delta（index 跨整个响应连续编号）"""
             nonlocal first_chunk_sent, _tool_call_count
@@ -3392,31 +3483,64 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         # 批量推给代理（约 100 字内容在 0.4 秒内倾泻而下），代理虽然逐块
         # flush，客户端体感仍是一次性输出。这里把倾泻下来的文本按自适应
         # 节奏匀速下发，还原真实流式体感：
-        #   - 单块超过 16 字时切成 ≤16 字的小片
-        #   - 片间隔 = 片长 / (30 + 已输出字数) 秒：短回复约 30-60 字/秒的
-        #     打字机效果；长回复自动加速，总平滑耗时按对数增长（约 4-5 秒封顶）
+        #   - 单块超过 8 字时切成 ≤8 字的小片，保证打字机颗粒感
+        #   - 节奏 v(n) = 40 * (1 + n/120) 字/秒（n 为本节拍器已输出字数）：
+        #     开场约 40 字/秒，是肉眼清晰可辨的打字机效果；随输出量按
+        #     对数曲线加速，长回复不拖沓。总平滑时长 ≈ 3*ln(1+N/120) 秒：
+        #     100 字≈1.8s，300 字≈3.8s，500 字≈4.9s，1000 字≈6.7s，3000 字≈9.8s
+        #     （旧公式 v=30+n 对长文加速过快：800 字 3.5 秒刷完，平均 250+ 字/秒，
+        #      终端体感仍是"一次性倾泻"，故换成对数曲线）
         #   - 若上游将来变为真实细粒度实时推送（到达慢于本节奏），节拍器
         #     天然无等待，不会引入任何额外延迟
-        _tw_state = {"next_t": None, "n": 0}
+        def _make_typewriter(emit):
+            """造一个独立的节拍器。推理与正文各用一个，互不影响节奏计数。"""
+            state = {"next_t": None, "n": 0}
 
-        def _smooth_emit(text):
-            if not text:
-                return
-            if len(text) <= 16:
-                pieces = [text]
+            def push(text):
+                if not text:
+                    return
+                if len(text) <= 8:
+                    pieces = [text]
+                else:
+                    pieces = [text[i:i + 8] for i in range(0, len(text), 8)]
+                for piece in pieces:
+                    now = time.time()
+                    if state["next_t"] is None:
+                        state["next_t"] = now
+                    wait = state["next_t"] - now
+                    if wait > 0:
+                        time.sleep(wait)
+                    emit(piece)
+                    state["n"] += len(piece)
+                    speed = 40.0 * (1.0 + state["n"] / 120.0)
+                    state["next_t"] = max(time.time(), state["next_t"]) \
+                        + len(piece) / speed
+
+            return push
+
+        _smooth_emit = _make_typewriter(_emit_content)
+        _smooth_reasoning = _make_typewriter(_emit_reasoning)
+
+        def send_reasoning(text):
+            """转发推理过程。OpenAI 兼容字段 reasoning_content，客户端不认就忽略。"""
+            if text:
+                _smooth_reasoning(text)
+
+        def send_tool(name, title, status, tool_input, tool_output):
+            """把 super-agent 的原生工具执行播报到推理流里。
+
+            OpenAI 协议没有「工具进度」通道，而客户端能渲染的就是
+            content / reasoning_content。这里塞进推理流，dsh 的思考面板
+            就会显示「[工具] read ← 路径」这样的进度，不再是空白等待。
+            """
+            label = (title or "").strip() or _short_input(tool_input)
+            if status == "running":
+                line = "\n[工具] %s ← %s\n" % (name or "?", label)
             else:
-                pieces = [text[i:i + 16] for i in range(0, len(text), 16)]
-            for piece in pieces:
-                now = time.time()
-                if _tw_state["next_t"] is None:
-                    _tw_state["next_t"] = now
-                wait = _tw_state["next_t"] - now
-                if wait > 0:
-                    time.sleep(wait)
-                _emit_content(piece)
-                _tw_state["n"] += len(piece)
-                _tw_state["next_t"] = max(time.time(), _tw_state["next_t"]) \
-                    + len(piece) / (30.0 + _tw_state["n"])
+                line = "\n[工具] %s ✓ %s\n" % (name or "?", label)
+            # 直接下发、不过打字机节拍器：进度播报是短行，切片会把标记切碎，
+            # 而且进度信息有时效性，压节奏反而让客户端看到的顺序错乱。
+            _emit_reasoning(line)
 
         def send_complete():
             nonlocal collected_tokens, first_chunk_sent
@@ -3548,7 +3672,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         listener = StreamingSSEListener(
             session_id, on_delta=send_delta, on_complete=send_complete,
-            on_error=send_error, timeout=600
+            on_error=send_error, timeout=600, on_reasoning=send_reasoning,
+            on_tool=send_tool
         )
         listener.on_confirmation = lambda cid, ctype, desc, tool: send_confirmation(cid, ctype, desc, tool)
         sse_thread = threading.Thread(target=listener.listen)
