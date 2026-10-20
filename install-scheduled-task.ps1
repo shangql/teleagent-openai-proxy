@@ -64,16 +64,11 @@ Write-Host "[INFO] 监听地址  : ${Host_Address}:$Port"
 Write-Host "[INFO] 日志      : $LogDir"
 Write-Host ""
 
-# ---- 包装成 .cmd，让计划任务直接调用 ----
-$runner = Join-Path $LogDir "run-proxy.cmd"
-$runnerContent = @"
-@echo off
-"$python" "$proxyScript" --host $Host_Address --port $Port
-"@
-[System.IO.File]::WriteAllText($runner, $runnerContent, (New-Object System.Text.UTF8Encoding($false)))
-
-# ---- 注册计划任务 ----
-$action = New-ScheduledTaskAction -Execute $runner
+# ---- 任务动作直接托管 python 进程 ----
+# 不用 .cmd 包装：Stop-ScheduledTask 只会回收它自己启动的进程树，
+# 经 cmd.exe 转发时 python 子进程会变成孤儿，继续占着 8088 端口，
+# 导致「停任务后端口仍被占用 / 出现两个监听者、请求随机分发」。
+$action = New-ScheduledTaskAction -Execute $python -Argument "`"$proxyScript`" --host $Host_Address --port $Port"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `

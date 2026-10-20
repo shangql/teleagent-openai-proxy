@@ -181,6 +181,33 @@ print(resp.choices[0].message.content)
 }
 ```
 
+## 会话自动放行（全会话「全自动执行」）
+
+TeleAgent 的会话权限以规则数组表达，在客户端界面把会话设成「全自动执行」，等价于给该会话预置一批 `allow` 规则。
+
+代理创建的会话若不带规则，AI 一旦触发外部目录、命令执行等敏感操作就会发出权限确认事件——**无头客户端（dsh、定时任务、CI）无人应答，请求会一直挂到超时**。本项能力让代理侧会话与手工设成「全自动执行」的会话行为一致。
+
+开启后代理会做两件事：
+
+- **新建会话**时预置 10 类权限的 allow 规则（`bash` `edit` `read` `write` `glob` `grep` `webfetch` `task` `tool` `external_directory`）
+- **既有会话**在收到权限确认事件时立即以 `always` 回复，既解锁当前请求，又让 TeleAgent 把该规则持久化到会话
+
+默认开启，可在控制台「认证」面板切换，或用 `--no-auto-approve` 关闭：
+
+```bash
+python openai_proxy.py --no-auto-approve
+```
+
+也可通过接口读写：
+
+```bash
+curl http://127.0.0.1:8088/api/auto-approve
+curl -X POST http://127.0.0.1:8088/api/auto-approve \
+  -H "Content-Type: application/json" -d '{"enabled": false}'
+```
+
+> 关闭后敏感操作会重新需要人工确认，可通过 `GET /api/permission/pending` 查看待确认项、`POST /api/permission/reply` 应答。
+
 ## Web 控制台
 
 访问 `http://127.0.0.1:8088/console` 即可使用：

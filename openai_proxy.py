@@ -399,10 +399,97 @@ def _auth_public_view(rec):
 
 
 # ============================================================
+# 自动放行（会话「全自动执行」）
+# ============================================================
+# TeleAgent 的会话权限以 permission 规则数组表达：
+#   [{permission: 类型, pattern: 匹配式, action: "allow"|"deny", source, timeCreated}]
+# 在 TeleAgent 界面把会话设成「全自动执行」，等价于给该会话预置一批 allow 规则。
+#
+# 代理创建的会话若不带规则，AI 一旦触发外部目录/命令等敏感操作就会发出
+# permission.asked 事件——无头客户端（如 dsh）无人应答，请求会一直挂到超时。
+# 这里在创建/复用会话时统一预置 allow 规则，使代理侧会话与手工设成
+# 「全自动执行」的会话行为一致。
+
+AUTO_APPROVE_PERMISSION_TYPES = (
+    "bash", "edit", "read", "write", "glob", "grep",
+    "webfetch", "task", "tool", "external_directory",
+)
+
+# 默认开启：代理面向本机/内网客户端，而本代理不做调用方隔离，
+# 权限确认对无头客户端没有出口。可用 --no-auto-approve 关闭。
+_auto_approve_enabled = True
+_auto_approve_applied = set()   # 已预置规则的 session_id
+_auto_approve_replied = set()   # 已自动回复过的 permission_id（防止 SSE 与全局监听器双通道重复回复）
+_auto_approve_lock = threading.Lock()
+
+
+def set_auto_approve(enabled):
+    """开关自动放行（控制台/命令行可调）。"""
+    global _auto_approve_enabled
+    _auto_approve_enabled = bool(enabled)
+    with _auto_approve_lock:
+        _auto_approve_applied.clear()
+
+
+def get_auto_approve():
+    return _auto_approve_enabled
+
+
+def auto_approve_rules():
+    """生成「全自动执行」规则数组：所有权限类型 × 任意路径 → allow。"""
+    if not _auto_approve_enabled:
+        return None
+    return [{"permission": t, "pattern": "*", "action": "allow"}
+            for t in AUTO_APPROVE_PERMISSION_TYPES]
+
+
+def ensure_session_permission(session_id):
+    """给会话补齐「全自动执行」规则。
+
+    注意：super-agent 的 PATCH /session/<id> 虽返回 200，但并不持久化
+    permission 字段（实测四种写法均无效），所以这里不做 PATCH。
+    既有会话的规则由「自动回复 always」路径补齐——见 auto_reply_permission()。
+    """
+    return False
+
+
+def auto_reply_permission(permission_id):
+    """自动回复权限确认：always（始终允许并把规则持久化到该会话）。
+
+    这条路径同时解决两件事：
+      1. 立刻解锁正在等待确认的请求（AI 继续往下走，无头客户端不会被挂住）；
+      2. super-agent 会把这条 allow 规则持久化到该会话，后续同会话不再重复询问。
+
+    对应用户在 TeleAgent 界面给会话设「全自动执行」的效果。
+    """
+    if not _auto_approve_enabled or not permission_id:
+        return False
+    with _auto_approve_lock:
+        if permission_id in _auto_approve_replied:
+            return True   # 已由另一条监听通道回复过
+        _auto_approve_replied.add(permission_id)
+    try:
+        ok, detail = reply_permission(permission_id, "always")
+    except Exception:
+        return False
+    if not ok:
+        with _auto_approve_lock:
+            _auto_approve_replied.discard(permission_id)
+        print(f"[WARN] 自动放行失败 {permission_id}: {detail}", file=sys.stderr)
+        return False
+    print(f"[INFO] 已自动放行权限 {permission_id}（always）", file=sys.stderr)
+    return True
+
+
+# ============================================================
 # 调用进程反查（lsof → PID → 友好名称）
 # ============================================================
 _caller_name_cache = {}   # (ip, port) -> {name, pid, cmd, time}
 _caller_name_lock = threading.Lock()
+# 按来源 IP 记住最近一次成功识别到的调用方，作为识别失败时的兜底，
+# 消除同一客户端因识别抖动产生两种会话标题、进而分成两套会话的问题。
+_caller_last_by_ip = {}   # ip -> {name, pid, cmd}
+_caller_last_by_ip_lock = threading.Lock()
 _CALLER_CACHE_TTL = 120   # 2分钟缓存
 
 
@@ -547,7 +634,7 @@ def build_source_session_title(source_tag, caller_name, raw_title):
     return f"{source_tag}{caller}|{base}"
 
 
-def _identify_caller_windows(client_port, ua_hint=None):
+def _identify_caller_windows(client_port, ua_hint=None, client_ip=""):
     """Windows 版调用方反查：用系统自带 netstat -ano 找到连接 8088 的客户端 PID。
 
     macOS 用 `lsof -i :8088`，Windows 没有 lsof，等价命令是 netstat -ano。
@@ -586,6 +673,14 @@ def _identify_caller_windows(client_port, ua_hint=None):
     # netstat 没查到时，退回 UA 识别结果
     if name in ("未知", "") and ua_hint:
         name = ua_hint
+    # UA 也没有时，用该来源 IP 上最近一次成功识别的结果兜底。
+    # 识别抖动（读不到进程命令行时退化为"未知"）会让同一客户端产生两种会话标题，
+    # 从而分成两套互不相通的会话——兜底消除这种抖动。
+    if name in ("未知", "") and client_ip:
+        with _caller_last_by_ip_lock:
+            last = _caller_last_by_ip.get(client_ip)
+        if last:
+            name = last.get("name") or name
     return name, pid, cmd
 
 
@@ -626,7 +721,11 @@ def identify_caller_process(client_ip, client_port, user_agent=""):
 
     # Windows 没有 lsof，改用 netstat -ano 反查
     if _IS_WINDOWS:
-        name, pid, cmd = _identify_caller_windows(client_port, ua_short_circuit)
+        name, pid, cmd = _identify_caller_windows(client_port, ua_short_circuit, client_ip)
+        # 记住本次成功识别结果，供同一来源 IP 后续识别失败时兜底
+        if name and name not in ("未知", "未知进程", "8088代理自身") and client_ip:
+            with _caller_last_by_ip_lock:
+                _caller_last_by_ip[client_ip] = {"name": name, "pid": pid, "cmd": cmd}
         with _caller_name_lock:
             _caller_name_cache[cache_key] = {"name": name, "pid": pid, "cmd": cmd, "time": now}
         return name, pid, cmd
@@ -1304,11 +1403,17 @@ def sa_request(method, path, body=None, timeout=30, _retry=True):
         return None, str(e), {}
 
 
-def create_session(directory=DEFAULT_DIRECTORY, title=None):
-    """创建新的 super-agent 会话，失败时自动刷新key重试"""
+def create_session(directory=DEFAULT_DIRECTORY, title=None, permission=None):
+    """创建新的 super-agent 会话，失败时自动刷新key重试
+
+    permission: 会话级权限规则（如「全自动执行」的 allow 规则），
+                由 super-agent 随会话一并持久化。
+    """
     body = {"directory": directory} if directory else {}
     if title:
         body["title"] = title
+    if permission:
+        body["permission"] = permission
     status, resp, _ = sa_request("POST", "/session", body)
     if status == 200:
         data = json.loads(resp)
@@ -1413,11 +1518,13 @@ def get_or_create_session(directory=DEFAULT_DIRECTORY, title=None):
     with _session_cache_lock:
         cached = _session_cache.get(cache_key)
         if cached and now - cached[1] < SESSION_CACHE_TTL:
+            ensure_session_permission(cached[0])
             return cached[0], True
 
     # 2. 按标题查已有会话
     sid = get_session_by_title(title, directory=directory)
     if sid:
+        ensure_session_permission(sid)
         with _session_cache_lock:
             _session_cache[cache_key] = (sid, now)
         return sid, True
@@ -1430,11 +1537,14 @@ def get_or_create_session(directory=DEFAULT_DIRECTORY, title=None):
         # 双检：等待锁期间可能已被其他线程创建
         _sid = get_session_by_title(title, directory=directory)
         if _sid:
+            ensure_session_permission(_sid)
             with _session_cache_lock:
                 _session_cache[cache_key] = (_sid, time.time())
             return _sid, True
-        sid = create_session(directory=directory, title=title)
+        sid = create_session(directory=directory, title=title,
+                            permission=auto_approve_rules())
         if sid:
+            ensure_session_permission(sid)
             with _session_cache_lock:
                 _session_cache[cache_key] = (sid, time.time())
         return sid, False
@@ -1910,6 +2020,9 @@ class SSEListener:
                 })
                 is_new = register_pending_confirmation(permission_id, "permission",
                                                        self.session_id, desc, tool)
+                # 自动放行：立刻以 always 回复，既解锁当前请求，
+                # 又让 super-agent 把该 allow 规则持久化到会话（等价「全自动执行」）
+                auto_reply_permission(permission_id)
                 # 仅首次登记时触发回调（避免双通道重复注入 SSE 确认）
                 if is_new and self.on_confirmation:
                     self.on_confirmation(permission_id, "permission", desc, tool)
@@ -2225,6 +2338,9 @@ class StreamingSSEListener(SSEListener):
                 })
                 is_new = register_pending_confirmation(permission_id, "permission",
                                                        self.session_id, desc, tool)
+                # 自动放行：立刻以 always 回复，既解锁当前请求，
+                # 又让 super-agent 把该 allow 规则持久化到会话（等价「全自动执行」）
+                auto_reply_permission(permission_id)
                 # 仅首次登记时触发回调（避免双通道重复注入 SSE 确认）
                 if is_new and self.on_confirmation:
                     self.on_confirmation(permission_id, "permission", desc, tool)
@@ -2325,6 +2441,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_api_auth_status()
         elif path == "/api/auth/keys":
             self._handle_api_auth_keys()
+        elif path == "/api/auto-approve":
+            self._handle_api_auto_approve()
         else:
             self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
 
@@ -2352,6 +2470,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_api_auth_keys()
         elif path == "/api/auth/mode":
             self._handle_api_auth_mode()
+        elif path == "/api/auto-approve":
+            self._handle_api_auto_approve()
         elif path.startswith("/api/auth/keys/"):
             self._handle_api_auth_key_update()
         else:
@@ -2386,6 +2506,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "listen": f"{self.server.server_address[0]}:{self.server.server_address[1]}",
                 "default_model": get_default_model(),
                 "default_directory": DEFAULT_DIRECTORY,
+                "auto_approve": get_auto_approve(),
             },
             "super_agent": {
                 "url": SUPER_AGENT_BASE,
@@ -2648,6 +2769,34 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         cfg["mode"] = mode
         _auth_save(cfg, force=True)
         self._send_json(200, {"mode": mode, "message": f"认证模式已切换为 {mode}"})
+
+    def _handle_api_auto_approve(self):
+        """GET/POST /api/auto-approve — 查看/切换会话自动放行（全会话「全自动执行」）。
+
+        开启时，代理创建或复用的 super-agent 会话会预置 allow 权限规则，
+        AI 触发外部目录/命令等敏感操作时不再弹 permission.asked，
+        无头客户端（dsh / CI / 定时任务）不会卡在等待确认上。
+        """
+        if self.command == "GET":
+            self._send_json(200, {
+                "enabled": get_auto_approve(),
+                "permission_types": list(AUTO_APPROVE_PERMISSION_TYPES),
+            })
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as e:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request"}})
+            return
+        if "enabled" not in data:
+            self._send_json(400, {"error": {"message": "enabled is required", "type": "invalid_request"}})
+            return
+        set_auto_approve(bool(data.get("enabled")))
+        self._send_json(200, {
+            "enabled": get_auto_approve(),
+            "message": "自动放行已%s" % ("开启" if get_auto_approve() else "关闭"),
+        })
 
     # ======== 权限/问题确认 API（机器人侧"群里确认/拒绝"） ========
 
@@ -3659,6 +3808,10 @@ button.ghost:hover{background:var(--dim)}
     <div id="authModeBox"></div>
   </div>
   <div class="card">
+    <div class="card-title">会话自动放行</div>
+    <div id="authAutoApproveBox"></div>
+  </div>
+  <div class="card">
     <div class="card-title">
       API Key
       <button class="primary" onclick="createAuthKey()">生成新 Key</button>
@@ -4252,9 +4405,10 @@ const AUTH_MODE_DESC = {
 
 async function loadAuth() {
   try {
-    const [st, kl] = await Promise.all([
+    const [st, kl, aa] = await Promise.all([
       fetch(API + '/api/auth/status').then(r => r.json()),
-      fetch(API + '/api/auth/keys').then(r => r.json())
+      fetch(API + '/api/auth/keys').then(r => r.json()),
+      fetch(API + '/api/auto-approve').then(r => r.json())
     ]);
     let modeHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
     for (const m of (st.modes || ['off','partial','strict'])) {
@@ -4265,6 +4419,20 @@ async function loadAuth() {
     modeHtml += `<div style="color:var(--dim);font-size:12px;margin-bottom:8px">${esc(AUTH_MODE_DESC[st.mode] || '')}</div>`;
     modeHtml += `<div style="color:var(--dim);font-size:12px">已启用：${st.enabled ? '是' : '否'} · Key 数量：${st.key_count} · 永远放行：${esc((st.exempt_paths||[]).join(', '))}</div>`;
     document.getElementById('authModeBox').innerHTML = modeHtml;
+
+    // 会话自动放行（全会话「全自动执行」）
+    document.getElementById('authAutoApproveBox').innerHTML =
+      `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <button class="${aa.enabled ? 'primary' : 'ghost'}" onclick="setAutoApprove(${aa.enabled ? 'false' : 'true'})">${aa.enabled ? '已开启' : '已关闭'}</button>
+        <span style="color:var(--dim);font-size:12px">点击${aa.enabled ? '关闭' : '开启'}</span>
+      </div>
+      <div style="color:var(--dim);font-size:12px">
+        开启后，代理创建或复用的 TeleAgent 会话会预置 allow 权限规则（等同在 TeleAgent 里把会话设为「全自动执行」）。
+        AI 触发外部目录、命令执行等敏感操作时不再弹确认，无头客户端（dsh / 定时任务 / CI）不会卡在等待确认上。
+      </div>
+      <div style="color:var(--dim);font-size:12px;margin-top:4px">
+        覆盖权限类型：${esc((aa.permission_types||[]).join(', '))}
+      </div>`;
 
     const keys = kl.keys || [];
     if (keys.length === 0) {
@@ -4304,6 +4472,18 @@ async function setAuthMode(mode) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({mode: mode})
+  });
+  const d = await r.json();
+  if (d.error) { alert(d.error.message); return; }
+  loadAuth();
+}
+
+async function setAutoApprove(enabled) {
+  if (!confirm(enabled ? '开启会话自动放行？' : '关闭会话自动放行？\\n\\n关闭后，AI 的敏感操作会重新需要人工确认，无头客户端可能卡住。')) return;
+  const r = await fetch(API + '/api/auto-approve', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: enabled})
   });
   const d = await r.json();
   if (d.error) { alert(d.error.message); return; }
@@ -4394,7 +4574,13 @@ def main():
     parser = argparse.ArgumentParser(description="TeleAgent OpenAI-Compatible Proxy")
     parser.add_argument("--port", type=int, default=8088, help="监听端口 (默认: 8088)")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
+    parser.add_argument("--no-auto-approve", action="store_true",
+                        help="关闭会话自动放行（默认开启：会话预置「全自动执行」权限规则）")
     args = parser.parse_args()
+
+    if args.no_auto_approve:
+        set_auto_approve(False)
+        print("[INFO] 会话自动放行已关闭，敏感操作将回退为需人工确认", file=sys.stderr)
 
     # 验证可以获取 session key
     key = get_session_key()

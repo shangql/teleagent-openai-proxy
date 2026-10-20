@@ -18,6 +18,12 @@ AIGC:
 
 ### 新增
 
+- **会话自动放行（全会话「全自动执行」）**：此前代理创建的 super-agent 会话不带任何 permission 规则，AI 一旦触发外部目录、命令执行等敏感操作就会发出权限确认事件——**无头客户端（dsh、定时任务、CI）无人应答，请求会一直挂到超时**（实测 200s 超时）。现在会话行为与在 TeleAgent 界面手工设成「全自动执行」一致
+  - 新建会话时预置 10 类权限的 allow 规则（`bash` `edit` `read` `write` `glob` `grep` `webfetch` `task` `tool` `external_directory`），由 super-agent 随会话持久化
+  - 既有会话在收到权限确认事件时立即以 `always` 回复，既解锁当前请求，又让 super-agent 把该规则持久化到会话
+  - 默认开启，可在控制台「认证」面板切换，或用 `--no-auto-approve` 关闭；也可读写 `GET/POST /api/auto-approve`
+  - 代理只认「创建时带规则」：`PATCH /session/<id>` 虽返回 200 但**不持久化** permission 字段（实测四种写法均无效），所以既有会话走「自动回复 always」而不是 PATCH
+
 - **用户登录鉴权基座**（`user_auth.py`）：在 API Key 认证之外补齐「人访问控制台」这一层。纯标准库实现，零第三方依赖，且**不 import `openai_proxy.py`**，可被单元测试直接驱动
   - **账号库**：`users.json`（与 `auth.json` 同目录，运行期生成，禁止入库），基于 JSON 文件 + 原子写（先写临时文件再 `os.replace`）+ 线程锁
   - **口令存储**：PBKDF2-HMAC-SHA256，210,000 次迭代、随机盐、哈希串自描述（算法与迭代次数随哈希一并保存，便于后续提升迭代次数）。口令策略只约束长度（10–256），不做字符集规则
@@ -33,11 +39,17 @@ AIGC:
 - **设计与实施文档**：`docs/adr-0001-user-login-auth-scheme.md`（架构决策记录）、`docs/user-login-api-contract.md`（前后端接口契约）、`docs/user-login-plan.md`（实施计划）
 - **实施计划留档**（`.omx/`）：深访规格、PRD、测试规格、Architect/Critic 两轮评审记录、三泳道分工与基线验证脚本
 
+### 修复
+
+- **调用方识别抖动导致同一客户端分裂成两套会话**：会话标题的第二段取自反查到的调用进程名，识别失败时退化为「未知」，于是「外部\|Node服务\|…」与「外部\|…」成为两个不同的匹配 key，同一客户端被拆成两套互不相通的会话（历史会话里两种标题并存即为证据）。现在按来源 IP 记住最近一次成功识别的结果作为兜底，消除抖动
+- **计划任务停止后 python 子进程变孤儿**：任务动作用 `.cmd` 转发时，`Stop-ScheduledTask` 只回收 cmd.exe，python.exe 继续存活并占着 8088；重启任务则出现两个监听者，Windows 的 `SO_REUSEADDR` 会把请求随机分发到两个实例。改为任务**直接托管 python 进程**，停止即回收
+
 ### 变更
 
 - `VERSION` 同步至 1.12.0，`.gitignore` 增加 `users.json`
+- 模块 docstring 与 README 的认证说明改为"默认不校验，可在控制台开启"，不再写死"不做校验"
 
-> 本版交付的是**鉴权基座**，尚未接入 `openai_proxy.py` 的路由层——`AuthManager` 已提供 `login` / `logout` / `authenticate` / `set_mode` 等门面方法，路由接入由后续泳道完成。
+> 本版交付的 `user_auth.py` 是**鉴权基座**，尚未接入 `openai_proxy.py` 的路由层——`AuthManager` 已提供 `login` / `logout` / `authenticate` / `set_mode` 等门面方法，路由接入由后续泳道完成。
 
 ## [1.11.0] - 2026-10-20
 
