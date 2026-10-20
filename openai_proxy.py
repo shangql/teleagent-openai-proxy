@@ -12,8 +12,10 @@ TeleAgent OpenAI-Compatible Proxy Server
   python3 openai_proxy.py [--port 8088] [--host 0.0.0.0]
 
 认证:
-  调用时在 Authorization: Bearer <token> 中传入任意值即可（不做校验）。
-  代理会自动从运行中的 scheduler 进程获取 super-agent 的 session key。
+  调用时在 Authorization: Bearer <token> 中传入任意值即可（默认不校验）。
+  可在 Web 控制台的「认证」面板开启校验，模式为 off / partial / strict 三档，
+  详见 README 的「认证（API Key）」章节。
+  代理会自动从运行中的 TeleAgent 进程获取 super-agent 的 session key。
 """
 
 import argparse
@@ -23,6 +25,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -168,6 +171,231 @@ def log_request(entry):
         if len(_request_log) > _MAX_LOG:
             _request_log.pop(0)
     log_request_to_disk(entry)
+
+
+# ============================================================
+# 认证（API Key）
+# ============================================================
+# 三档模式（控制台可切换）：
+#   off     - 不校验（默认，保持旧行为，客户端 api_key 随便填）
+#   partial - 只校验本代理签发的 key（tap- 前缀）；其它值放行，记为未认证来源
+#   strict  - 所有受保护路径必须携带有效 key，否则 401
+#
+# 端点分两层：
+#   数据面 /v1/*      - 按上面的模式校验
+#   管理面 /api/*      - 本机来源放行（控制台自举），非本机来源同数据面规则
+#   豁免路径           - /console /health /favicon.ico 永远放行
+#
+# 密钥只支持服务端生成（secrets.token_urlsafe(32)，256 位随机）：
+#   高熵 key 用单轮 SHA-256 即可（慢 KDF 是针对低熵人类口令的）；
+#   存储只落加盐哈希 + 无盐索引，完整 key 仅在创建时返回一次。
+
+AUTH_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.json")
+AUTH_KEY_PREFIX = "tap-"
+AUTH_MODES = ("off", "partial", "strict")
+AUTH_EXEMPT_PATHS = ("/console", "/health", "/favicon.ico", "/favicon")
+AUTH_LOCAL_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+AUTH_LAST_USED_FLUSH_INTERVAL = 60   # 秒，last_used_at 落盘节流
+
+_auth_lock = threading.RLock()
+_auth_config = None
+_auth_last_flush = 0
+
+
+def _auth_default_config():
+    return {"version": 1, "mode": "off", "keys": []}
+
+
+def _auth_load():
+    """读取认证配置（带内存缓存）。"""
+    global _auth_config
+    with _auth_lock:
+        if _auth_config is not None:
+            return _auth_config
+        cfg = _auth_default_config()
+        try:
+            if os.path.exists(AUTH_CONFIG_FILE):
+                with open(AUTH_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    mode = loaded.get("mode")
+                    if mode in AUTH_MODES:
+                        cfg["mode"] = mode
+                    keys = loaded.get("keys")
+                    if isinstance(keys, list):
+                        cfg["keys"] = [k for k in keys if isinstance(k, dict)]
+        except Exception as e:
+            print(f"[WARN] 读取认证配置失败: {e}", file=sys.stderr)
+        _auth_config = cfg
+        return cfg
+
+
+def _auth_save(cfg, force=False):
+    """原子写回认证配置。"""
+    global _auth_config, _auth_last_flush
+    with _auth_lock:
+        now = int(time.time())
+        if not force and (now - _auth_last_flush) < AUTH_LAST_USED_FLUSH_INTERVAL:
+            _auth_config = cfg
+            return
+        tmp = AUTH_CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, AUTH_CONFIG_FILE)
+            _auth_last_flush = now
+        except Exception as e:
+            print(f"[WARN] 保存认证配置失败: {e}", file=sys.stderr)
+        _auth_config = cfg
+
+
+def _auth_hash_key(token, salt_hex):
+    """带盐哈希：sha256(salt || key)。"""
+    salt = bytes.fromhex(salt_hex)
+    return hashlib.sha256(salt + token.encode("utf-8")).hexdigest()
+
+
+def _auth_lookup(token):
+    """无盐索引：sha256(key)，用于多密钥时 O(1) 定位候选。"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _auth_mask(token):
+    """掩码显示，避免在错误信息里泄露完整 key。"""
+    if not token:
+        return ""
+    if len(token) <= 10:
+        return token[:3] + "…"
+    return token[:8] + "…" + token[-4:]
+
+
+def _auth_generate(name=None, allowed_models=None, expire_at=None):
+    """生成新 key。返回 (记录, 完整 key)。
+
+    不支持自定义 key：代理分发的 key 需要高熵，自填口令会引入弱密钥风险。
+    """
+    full = AUTH_KEY_PREFIX + secrets.token_urlsafe(32)
+    salt = os.urandom(16)
+    key_id = "k_" + uuid.uuid4().hex[:8]
+    record = {
+        "id": key_id,
+        "name": (name or key_id).strip()[:60],
+        "prefix": full[:12] + "…",
+        "salt": salt.hex(),
+        "hash": hashlib.sha256(salt + full.encode("utf-8")).hexdigest(),
+        "lookup": _auth_lookup(full),
+        "status": "enabled",
+        "created_at": int(time.time()),
+        "last_used_at": None,
+        "expire_at": expire_at,
+        "allowed_models": allowed_models,
+    }
+    return record, full
+
+
+def _auth_match(token):
+    """按 token 查找 key 记录；未命中返回 None。"""
+    if not token:
+        return None
+    lookup = _auth_lookup(token)
+    cfg = _auth_load()
+    for rec in cfg.get("keys", []):
+        if rec.get("lookup") != lookup:
+            continue
+        try:
+            calc = _auth_hash_key(token, rec.get("salt", ""))
+        except ValueError:
+            continue
+        if hmac.compare_digest(calc, rec.get("hash", "")):
+            return rec
+    return None
+
+
+def _auth_extract_token(headers):
+    """提取 Bearer token，兼容 x-api-key / xi-api-key。"""
+    auth = headers.get("Authorization") or headers.get("authorization")
+    if auth:
+        parts = auth.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip() or None
+        if len(parts) == 1:
+            return parts[0].strip() or None
+    for h in ("x-api-key", "xi-api-key"):
+        v = headers.get(h)
+        if v:
+            return v.strip()
+    return None
+
+
+def _auth_error(message, code="invalid_api_key"):
+    """OpenAI 兼容的错误体，openai SDK 会识别为 AuthenticationError。"""
+    return {"error": {"message": message, "type": "invalid_request_error",
+                      "param": None, "code": code}}
+
+
+def _auth_is_local(handler):
+    ip = handler.client_address[0] if handler.client_address else ""
+    return ip in AUTH_LOCAL_IPS
+
+
+def _auth_check(handler, path):
+    """统一认证入口。返回 (ok, error_body, key_record)。
+
+    放在 do_GET / do_POST 的最前面统一调用，避免逐路由加判断时漏掉端点。
+    """
+    cfg = _auth_load()
+    mode = cfg.get("mode", "off")
+    if mode == "off":
+        return True, None, None
+
+    if path in AUTH_EXEMPT_PATHS or path.startswith("/console/"):
+        return True, None, None
+
+    # 管理面：本机来源放行（控制台要能改认证配置），非本机来源按数据面规则校验
+    if path.startswith("/api/") and _auth_is_local(handler):
+        return True, None, None
+
+    token = _auth_extract_token(handler.headers)
+    record = _auth_match(token) if token else None
+
+    if record is not None:
+        if record.get("status") != "enabled":
+            return False, _auth_error("API key 已停用"), None
+        expire_at = record.get("expire_at")
+        if expire_at and int(time.time()) > int(expire_at):
+            return False, _auth_error("API key 已过期"), None
+        record["last_used_at"] = int(time.time())
+        _auth_save(cfg)
+        return True, None, record
+
+    if mode == "partial":
+        # 只对签发 key 生效；其它取值（含客户端沿用的 api_key="any"）放行
+        if token and token.startswith(AUTH_KEY_PREFIX):
+            return False, _auth_error(
+                "Incorrect API key provided: %s" % _auth_mask(token)), None
+        return True, None, None
+
+    # strict
+    if not token:
+        return False, _auth_error(
+            "You didn't provide an API key. You need to provide your API key in the "
+            "Authorization header, using Bearer auth (e.g. 'Authorization: Bearer YOUR_API_KEY')."), None
+    return False, _auth_error(
+        "Incorrect API key provided: %s" % _auth_mask(token)), None
+
+
+def _auth_public_view(rec):
+    """对外暴露的 key 视图：不含哈希与索引。"""
+    return {
+        "id": rec.get("id"),
+        "name": rec.get("name"),
+        "prefix": rec.get("prefix"),
+        "status": rec.get("status", "enabled"),
+        "created_at": rec.get("created_at"),
+        "last_used_at": rec.get("last_used_at"),
+        "expire_at": rec.get("expire_at"),
+        "allowed_models": rec.get("allowed_models"),
+    }
 
 
 # ============================================================
@@ -2027,6 +2255,9 @@ class StreamingSSEListener(SSEListener):
 # OpenAI 兼容 HTTP 服务器
 # ============================================================
 class OpenAIHandler(BaseHTTPRequestHandler):
+    # 本次请求通过认证的 key 记录（未认证为 None）
+    _auth_key = None
+
     def log_message(self, format, *args):
         # 简化日志
         print(f"[{self.log_date_time_string()}] {format % args}", file=sys.stderr)
@@ -2062,6 +2293,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         # 去掉 query string
         path = self.path.split("?")[0]
+        # 统一认证（放在路由分发之前，避免漏掉端点）
+        ok, err, rec = _auth_check(self, path)
+        if not ok:
+            self._send_json(401, err)
+            return
+        self._auth_key = rec
         if path == "/v1/models":
             self._handle_models()
         elif path == "/health" or path == "/":
@@ -2084,11 +2321,21 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_permission_reply()
         elif path == "/api/permission/pending":
             self._handle_permission_pending()
+        elif path == "/api/auth/status":
+            self._handle_api_auth_status()
+        elif path == "/api/auth/keys":
+            self._handle_api_auth_keys()
         else:
             self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        # 统一认证（放在路由分发之前，避免漏掉端点）
+        ok, err, rec = _auth_check(self, path)
+        if not ok:
+            self._send_json(401, err)
+            return
+        self._auth_key = rec
         if path == "/v1/chat/completions":
             self._handle_chat_completions()
         elif path == "/v1/embeddings":
@@ -2101,6 +2348,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_permission_reply()
         elif path == "/api/permission/inject":
             self._handle_permission_inject()
+        elif path == "/api/auth/keys":
+            self._handle_api_auth_keys()
+        elif path == "/api/auth/mode":
+            self._handle_api_auth_mode()
+        elif path.startswith("/api/auth/keys/"):
+            self._handle_api_auth_key_update()
         else:
             self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
 
@@ -2277,6 +2530,124 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "model": model, "prompt": prompt, "response": text,
             "tokens": listener.tokens, "duration_ms": duration, "error": listener.error,
         })
+
+    def do_PATCH(self):
+        path = self.path.split("?")[0]
+        ok, err, rec = _auth_check(self, path)
+        if not ok:
+            self._send_json(401, err)
+            return
+        self._auth_key = rec
+        if path.startswith("/api/auth/keys/"):
+            self._handle_api_auth_key_update()
+        else:
+            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
+
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        ok, err, rec = _auth_check(self, path)
+        if not ok:
+            self._send_json(401, err)
+            return
+        self._auth_key = rec
+        if path.startswith("/api/auth/keys/"):
+            self._handle_api_auth_key_update()
+        else:
+            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
+
+    # ======== 认证 API ========
+
+    def _handle_api_auth_status(self):
+        """认证状态：当前模式、key 数量、本次请求是否已认证。"""
+        cfg = _auth_load()
+        active = getattr(self, "_auth_key", None) or {}
+        self._send_json(200, {
+            "mode": cfg.get("mode", "off"),
+            "enabled": cfg.get("mode", "off") != "off",
+            "key_count": len(cfg.get("keys", [])),
+            "active_key": active.get("name"),
+            "modes": list(AUTH_MODES),
+            "exempt_paths": list(AUTH_EXEMPT_PATHS),
+        })
+
+    def _handle_api_auth_keys(self):
+        """列出或创建 API key。"""
+        if self.command == "GET":
+            cfg = _auth_load()
+            self._send_json(200, {
+                "keys": [_auth_public_view(k) for k in cfg.get("keys", [])]})
+            return
+        if self.command != "POST":
+            self._send_json(405, {"error": {"message": "Method not allowed", "type": "invalid_request"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as e:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request"}})
+            return
+        name = (data.get("name") or "").strip()
+        allowed_models = (data.get("allowed_models") or "").strip() or None
+        expire_at = data.get("expire_at")
+        rec, full = _auth_generate(name or None, allowed_models, expire_at)
+        cfg = _auth_load()
+        cfg.setdefault("keys", []).append(rec)
+        _auth_save(cfg, force=True)
+        # 完整 key 只在创建时返回这一次
+        self._send_json(200, {"key": full, "info": _auth_public_view(rec)})
+
+    def _handle_api_auth_key_update(self):
+        """更新或吊销单个 key，路径 /api/auth/keys/<id>。"""
+        key_id = self.path.split("?")[0].rsplit("/", 1)[-1]
+        cfg = _auth_load()
+        keys = cfg.setdefault("keys", [])
+        target = next((k for k in keys if k.get("id") == key_id), None)
+        if not target:
+            self._send_json(404, {"error": {"message": "Key not found", "type": "invalid_request"}})
+            return
+        if self.command == "DELETE":
+            keys.remove(target)
+            _auth_save(cfg, force=True)
+            self._send_json(200, {"success": True, "message": f"已吊销 {key_id}"})
+            return
+        if self.command != "PATCH":
+            self._send_json(405, {"error": {"message": "Method not allowed", "type": "invalid_request"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as e:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request"}})
+            return
+        if "name" in data:
+            target["name"] = (data.get("name") or target.get("name"))[:60]
+        if "status" in data and data.get("status") in ("enabled", "disabled"):
+            target["status"] = data.get("status")
+        if "allowed_models" in data:
+            target["allowed_models"] = (data.get("allowed_models") or "").strip() or None
+        if "expire_at" in data:
+            target["expire_at"] = data.get("expire_at")
+        _auth_save(cfg, force=True)
+        self._send_json(200, {"key": _auth_public_view(target)})
+
+    def _handle_api_auth_mode(self):
+        """切换认证模式。"""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as e:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request"}})
+            return
+        mode = (data.get("mode") or "").strip()
+        if mode not in AUTH_MODES:
+            self._send_json(400, {"error": {
+                "message": "mode 必须是 %s 之一" % ", ".join(AUTH_MODES),
+                "type": "invalid_request"}})
+            return
+        cfg = _auth_load()
+        cfg["mode"] = mode
+        _auth_save(cfg, force=True)
+        self._send_json(200, {"mode": mode, "message": f"认证模式已切换为 {mode}"})
 
     # ======== 权限/问题确认 API（机器人侧"群里确认/拒绝"） ========
 
@@ -2523,6 +2894,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         stream = req_data.get("stream", False)
         model = req_data.get("model", get_default_model())
         stream_options = req_data.get("stream_options", {}) or {}
+
+        # key 的模型白名单（作用域不足 → 403，与认证失败 401 区分）
+        rec = getattr(self, "_auth_key", None)
+        if rec:
+            allowed = rec.get("allowed_models")
+            if allowed:
+                allowed_list = [m.strip() for m in allowed.split(",") if m.strip()]
+                if allowed_list and not any(model == a or model.startswith(a + "/")
+                                           for a in allowed_list):
+                    self._send_json(403, _auth_error(
+                        "该 API key 无权使用模型: %s" % model, "model_not_allowed"))
+                    return
         tools = req_data.get("tools", None)  # 提取 tools 参数
         if tools:
             tool_names = [t.get("function", t).get("name", "?") for t in tools if isinstance(t, dict)]
@@ -2654,6 +3037,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "session_reused": session_reused,
             "source": source_tag,
             "source_detail": source_detail,
+            "api_key_name": (getattr(self, "_auth_key", None) or {}).get("name"),
             "client_ip": client_ip,
             "user_agent": user_agent[:80],
             "caller": caller_name,
@@ -3194,6 +3578,7 @@ button.ghost:hover{background:var(--dim)}
     <a onclick="showPage('models',this)">模型</a>
     <a onclick="showPage('logs',this)">日志</a>
     <a onclick="showPage('test',this)">测试</a>
+    <a onclick="showPage('auth',this)">认证</a>
     <a onclick="showPage('guide',this)">说明</a>
     <a onclick="showPage('sessions',this)">会话</a>
     <a onclick="showPage('system',this)">系统</a>
@@ -3260,6 +3645,34 @@ button.ghost:hover{background:var(--dim)}
         <label>响应结果</label>
         <div class="output" id="testOutput">等待测试...</div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 认证 ===== -->
+<div class="page" id="page-auth">
+  <div class="card">
+    <div class="card-title">
+      认证模式
+      <button class="ghost" onclick="loadAuth()">刷新</button>
+    </div>
+    <div id="authModeBox"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">
+      API Key
+      <button class="primary" onclick="createAuthKey()">生成新 Key</button>
+    </div>
+    <div id="authKeyList"></div>
+  </div>
+  <div class="card" id="authNewKeyCard" style="display:none">
+    <div class="card-title">新 Key（仅显示这一次）</div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="text" id="authNewKeyValue" readonly style="flex:1;font-family:monospace">
+      <button class="primary" onclick="copyAuthKey()">复制</button>
+    </div>
+    <div style="color:var(--yellow);font-size:12px;margin-top:8px">
+      关闭后无法再次查看完整 Key。代理只保存加盐哈希，列表里只显示前缀。
     </div>
   </div>
 </div>
@@ -3485,6 +3898,7 @@ function showPage(name, el) {
   // 切换页面时自动加载数据
   if (name === 'logs') loadLogs();
   if (name === 'sessions') loadSessions();
+  if (name === 'auth') loadAuth();
 }
 
 // ===== 状态加载 =====
@@ -3827,6 +4241,116 @@ async function loadSessions() {
   } catch(e) {
     document.getElementById('sessionTable').innerHTML = '<div style="color:var(--red)">加载失败</div>';
   }
+}
+
+// ===== 认证 =====
+const AUTH_MODE_DESC = {
+  off: '不校验任何 API Key。客户端可以填任意值，也可以完全不传。',
+  partial: '只校验本代理签发的 Key（tap- 前缀）；其它取值一律放行。适合先把 Key 分发下去做用量归因，再收紧。',
+  strict: '所有受保护路径都必须携带有效的 Key，否则返回 401。现有客户端需要改成使用签发的 Key。'
+};
+
+async function loadAuth() {
+  try {
+    const [st, kl] = await Promise.all([
+      fetch(API + '/api/auth/status').then(r => r.json()),
+      fetch(API + '/api/auth/keys').then(r => r.json())
+    ]);
+    let modeHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
+    for (const m of (st.modes || ['off','partial','strict'])) {
+      const active = m === st.mode;
+      modeHtml += `<button class="${active ? 'primary' : 'ghost'}" onclick="setAuthMode('${m}')">${m}</button>`;
+    }
+    modeHtml += '</div>';
+    modeHtml += `<div style="color:var(--dim);font-size:12px;margin-bottom:8px">${esc(AUTH_MODE_DESC[st.mode] || '')}</div>`;
+    modeHtml += `<div style="color:var(--dim);font-size:12px">已启用：${st.enabled ? '是' : '否'} · Key 数量：${st.key_count} · 永远放行：${esc((st.exempt_paths||[]).join(', '))}</div>`;
+    document.getElementById('authModeBox').innerHTML = modeHtml;
+
+    const keys = kl.keys || [];
+    if (keys.length === 0) {
+      document.getElementById('authKeyList').innerHTML =
+        '<div style="color:var(--dim);text-align:center;padding:20px">还没有 Key，点击右上角生成</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>可用模型</th>'
+      + '<th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead><tbody>';
+    for (const k of keys) {
+      const created = k.created_at ? new Date(k.created_at * 1000).toLocaleString() : '—';
+      const used = k.last_used_at ? new Date(k.last_used_at * 1000).toLocaleString() : '—';
+      const enabled = k.status === 'enabled';
+      html += `<tr>
+        <td>${esc(k.name||'')}</td>
+        <td style="font-family:monospace;font-size:12px">${esc(k.prefix||'')}</td>
+        <td><span class="tag ${enabled ? 'green' : 'gray'}">${enabled ? '启用' : '停用'}</span></td>
+        <td style="font-size:12px">${k.allowed_models ? esc(k.allowed_models) : '全部'}</td>
+        <td style="white-space:nowrap;font-size:12px">${created}</td>
+        <td style="white-space:nowrap;font-size:12px">${used}</td>
+        <td style="white-space:nowrap">
+          <button class="ghost" onclick="toggleAuthKey('${k.id}','${enabled ? 'disabled' : 'enabled'}')">${enabled ? '停用' : '启用'}</button>
+          <button class="ghost" onclick="deleteAuthKey('${k.id}')">吊销</button>
+        </td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('authKeyList').innerHTML = html;
+  } catch(e) {
+    document.getElementById('authModeBox').innerHTML = '<div style="color:var(--red)">加载失败</div>';
+  }
+}
+
+async function setAuthMode(mode) {
+  if (!confirm('切换认证模式为 ' + mode + '？\\n\\nstrict 模式下，未携带有效 Key 的现有客户端会开始返回 401。')) return;
+  const r = await fetch(API + '/api/auth/mode', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode: mode})
+  });
+  const d = await r.json();
+  if (d.error) { alert(d.error.message); return; }
+  loadAuth();
+}
+
+async function createAuthKey() {
+  const name = prompt('Key 名称（用于日志归因）：', 'key-' + new Date().toISOString().slice(0,10));
+  if (name === null) return;
+  const r = await fetch(API + '/api/auth/keys', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name})
+  });
+  const d = await r.json();
+  if (d.error) { alert(d.error.message); return; }
+  document.getElementById('authNewKeyCard').style.display = 'block';
+  document.getElementById('authNewKeyValue').value = d.key;
+  loadAuth();
+}
+
+function copyAuthKey() {
+  const v = document.getElementById('authNewKeyValue').value;
+  navigator.clipboard.writeText(v).then(() => {
+    const btn = document.querySelector('#authNewKeyCard .primary');
+    btn.textContent = '已复制';
+    setTimeout(() => { btn.textContent = '复制'; }, 1500);
+  });
+}
+
+async function toggleAuthKey(id, status) {
+  const r = await fetch(API + '/api/auth/keys/' + id, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({status: status})
+  });
+  const d = await r.json();
+  if (d.error) { alert(d.error.message); return; }
+  loadAuth();
+}
+
+async function deleteAuthKey(id) {
+  if (!confirm('吊销该 Key？使用它的客户端将立即失效。')) return;
+  const r = await fetch(API + '/api/auth/keys/' + id, {method: 'DELETE'});
+  const d = await r.json();
+  if (d.error) { alert(d.error.message); return; }
+  loadAuth();
 }
 
 // ===== 工具函数 =====

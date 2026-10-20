@@ -132,10 +132,54 @@ print(resp.choices[0].message.content)
 | 配置项 | 值 |
 |--------|-----|
 | API Base URL | `http://127.0.0.1:8088/v1` |
-| API Key | `any`（随意填写） |
+| API Key | `any`（未开启认证时随意填） |
 | 模型名 | `NewApi/chat-pro` |
 
 已验证可接入：OpenAI Python SDK、LangChain、Cursor、Continue、ChatBox、NextChat 等。
+
+## 认证（API Key）
+
+控制台的「认证」面板可随时开关并管理 API Key，改动即时生效，无需重启。
+
+### 三档模式
+
+| 模式 | 校验行为 | 适用场景 |
+|------|---------|---------|
+| `off` | 不校验任何 Key（默认） | 纯本机个人使用，保持旧行为 |
+| `partial` | 只校验本代理签发的 Key（`tap-` 前缀）；其它取值放行 | 多客户端已接入，先做用量归因再收紧 |
+| `strict` | 所有受保护路径必须携带有效 Key，否则 401 | 局域网共享，需要真正的访问控制 |
+
+`partial` 是过渡档：现有客户端配 `api_key="any"` 的用法不受影响，同时可以先拿到按 Key 的用量归因。
+
+### 端点保护范围
+
+- **数据面** `/v1/*`：`partial` / `strict` 下校验 `Authorization: Bearer <key>`（也兼容 `x-api-key` 头）
+- **管理面** `/api/*`：本机来源（`127.0.0.1` / `::1`）放行，非本机来源按数据面规则校验
+- **永远放行**：`/console`、`/health`、`/favicon.ico`
+
+管理面按来源分层而不是给控制台加登录，是因为本项目是单机代理：默认只监听回环地址时本机浏览器改配置不受阻，一旦改成 `0.0.0.0`，管理面自动纳入 Key 校验。校验在路由分发之前统一执行，不会漏掉端点。
+
+### 密钥的生成与存储
+
+- 密钥**只支持服务端生成**（`tap-` + 43 字符随机串，256 位熵），不支持自定义——需要分发给脚本和第三方客户端的 Key 应当是高熵随机值
+- 存储在脚本同级的 `auth.json`，只落**加盐哈希**（`sha256(salt || key)`）与无盐索引，明文 Key **仅在创建时返回一次**，之后列表只显示前缀
+- 支持按 Key 停用、吊销、设置过期时间、限定可用模型（越权返回 403）
+- 请求日志新增 `api_key_name` 字段，可按 Key 归因用量
+
+### 切换到 strict 之前
+
+`strict` 模式下现有客户端需要改用签发的 Key，否则会收到 401。响应体与 OpenAI 一致，OpenAI SDK 会直接抛出 `AuthenticationError`：
+
+```json
+{
+  "error": {
+    "message": "Incorrect API key provided: tap-7f3c…abcd",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "invalid_api_key"
+  }
+}
+```
 
 ## Web 控制台
 
@@ -143,8 +187,9 @@ print(resp.choices[0].message.content)
 
 - **仪表盘**：实时统计（请求数/Token/错误率）、服务状态、模型调用统计
 - **模型管理**：浏览 TeleAgent 中已配置成功的模型（按 Provider 分组），新增配置自动同步
+- **认证**：开关认证模式、生成与吊销 API Key、设置可用模型范围
 - **默认模型设置**：在「系统」页修改默认模型，保存后立即生效
-- **请求日志**：查看最近 200 条请求的时间/模型/状态/耗时/Token
+- **请求日志**：查看最近 200 条请求的时间/模型/状态/耗时/Token，并按 API Key 归因
 - **在线测试**：直接在页面发送请求并查看响应
 - **会话管理**：查看 super-agent 创建的会话列表
 - **系统信息**：版本、签名机制、API 端点文档
@@ -263,11 +308,19 @@ signature = HMAC-SHA256(session_key, payload).digest("base64url")
 | GET | `/api/sessions` | super-agent 会话列表 |
 | GET | `/api/stats` | 统计数据 |
 | POST | `/api/test` | 在线测试接口 |
+| GET | `/api/auth/status` | 认证模式、Key 数量、本次请求是否已认证 |
+| GET | `/api/auth/keys` | API Key 列表（仅前缀） |
+| POST | `/api/auth/keys` | 创建 API Key（完整 Key 仅此一次返回） |
+| PATCH | `/api/auth/keys/<id>` | 改名、启停、设置可用模型与过期时间 |
+| DELETE | `/api/auth/keys/<id>` | 吊销 API Key |
+| POST | `/api/auth/mode` | 切换认证模式（`off` / `partial` / `strict`） |
 
 ## 技术细节
 
-- **零依赖**：纯 Python 标准库（`http.server`, `hmac`, `json`, `threading`），无第三方包
+- **零依赖**：纯 Python 标准库（`http.server`, `hmac`, `json`, `threading`, `secrets`, `hashlib`），无第三方包
 - **跨平台**：macOS 与 Windows 共用同一份业务代码；平台差异集中在 session key 提取与调用方反查两处（Windows 分支基于 `ctypes`）
+- **认证分层**：校验在路由分发之前统一执行，管理面按来源分层，避免出现"部分端点受保护"的假安全感
+- **密钥存储**：只落加盐哈希，明文仅创建时返回一次；多 Key 用无盐索引 O(1) 定位候选
 - **线程安全**：每个请求独立线程处理，SSE 监听器在子线程运行
 - **会话隔离**：每次 API 请求创建独立的 super-agent 会话
 - **日志环形缓冲**：保留最近 200 条请求日志

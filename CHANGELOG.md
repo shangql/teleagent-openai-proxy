@@ -14,6 +14,31 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.11.0] - 2026-10-20
+
+### 新增
+
+- **API Key 认证（控制台可配置）**：此前代理完全不校验 `Authorization`，README 明确写着"随意填，不校验"。现在控制台新增「认证」面板，可随时开关并管理 Key，改动即时生效无需重启
+  - **三档模式**：`off`（默认，保持旧行为）/ `partial`（只校验本代理签发的 `tap-` 前缀 Key，其它取值放行）/ `strict`（所有受保护路径必须携带有效 Key，否则 401）
+    - `partial` 是过渡档：现有客户端配 `api_key="any"` 的用法不受影响，同时可先拿到按 Key 的用量归因，再切 `strict`
+  - **端点分层**：数据面 `/v1/*` 校验 `Authorization: Bearer`（兼容 `x-api-key`）；管理面 `/api/*` 本机来源（`127.0.0.1` / `::1`）放行、非本机来源同数据面规则；`/console`、`/health`、`/favicon.ico` 永远放行
+    - 管理面按来源分层而非给控制台加登录：单机场景下"绑哪个地址"是用户本来就要做的决定，而管理面若裸奔，局域网可直接改配置
+    - 校验放在 `do_GET` / `do_POST` 路由分发**之前**统一执行，避免按前缀枚举时漏掉端点（vLLM 的 `--api-key` 只覆盖 `/v1` `/v2` `/inference` `/cohere`，`/invocations` 可无凭据完成同样的推理）
+  - **密钥生成与存储**：只支持服务端生成（`tap-` + `secrets.token_urlsafe(32)`，256 位熵），不支持自定义——需分发给脚本和第三方客户端的 Key 应是高熵随机值
+    - 存储在脚本同级的 `auth.json`，只落**加盐哈希** `sha256(salt || key)` 与无盐索引 `sha256(key)`；明文 Key **仅在创建时返回一次**，列表只显示前缀
+    - 多 Key 校验先用无盐索引 O(1) 定位候选，再做带盐比对（`hmac.compare_digest`），两次 SHA-256，微秒级
+    - 存哈希而非明文的额外理由：控制台本身可能对局域网可达，明文存储等于把密钥管理的入口变成密钥泄漏的入口
+  - **Key 生命周期**：按 Key 停用、吊销、设置过期时间、限定可用模型范围（越权返回 403，区别于认证失败的 401）
+  - **用量归因**：请求日志新增 `api_key_name` 字段，复用既有的来源追踪与 `logs/requests-YYYY-MM-DD.jsonl` 落盘
+  - **管理接口**：`GET /api/auth/status`、`GET/POST /api/auth/keys`、`PATCH/DELETE /api/auth/keys/<id>`、`POST /api/auth/mode`
+  - **错误体与 OpenAI 一致**：`{"error":{"message","type","param","code"}}` + `code: "invalid_api_key"`，OpenAI SDK 直接抛 `AuthenticationError`；401 表示认证失败，403 表示作用域不足
+  - 认证在解析请求体**之前**完成，失败请求不消耗额度、不占用 super-agent 会话
+  - `auth.json` 加入 `.gitignore`
+
+### 变更
+
+- 模块 docstring 与 README 的认证说明改为"默认不校验，可在控制台开启"，不再写死"不做校验"
+
 ## [1.10.0] - 2026-10-20
 
 ### 新增
