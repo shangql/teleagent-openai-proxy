@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import socket
@@ -35,6 +36,18 @@ import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+
+# ============================================================
+# 平台标识
+# ============================================================
+# macOS  : 官方支持平台，session key 通过 pgrep + ps eww 获取，launchd 持久化
+# Windows: session key 通过读取 TeleAgent 子进程 PEB 环境块获取（见下方实现）
+_IS_WINDOWS = os.name == "nt"
+
+# 控制台「系统信息」展示用的平台文案
+PLATFORM_LABEL = "Windows (手动 / 任务计划程序)" if _IS_WINDOWS else "macOS (launchd)"
+SESSION_KEY_SOURCE_LABEL = ("TeleAgent 进程 PEB 环境块" if _IS_WINDOWS
+                            else "pgrep scheduler → ps eww")
 
 # ============================================================
 # 配置
@@ -306,6 +319,48 @@ def build_source_session_title(source_tag, caller_name, raw_title):
     return f"{source_tag}{caller}|{base}"
 
 
+def _identify_caller_windows(client_port, ua_hint=None):
+    """Windows 版调用方反查：用系统自带 netstat -ano 找到连接 8088 的客户端 PID。
+
+    macOS 用 `lsof -i :8088`，Windows 没有 lsof，等价命令是 netstat -ano。
+    netstat 只能给出 PID，拿不到 cwd（Windows 未开放该接口），对来源识别影响有限。
+    """
+    name, pid, cmd = "未知", 0, ""
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True,
+            timeout=5, errors="replace"
+        )
+        target = str(client_port)
+        for line in (result.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) < 5 or parts[0].upper() != "TCP":
+                continue
+            local, remote, state, os_pid = parts[1], parts[2], parts[3], parts[-1]
+            if state.upper() != "ESTABLISHED":
+                continue
+            # 客户端行形如：TCP 127.0.0.1:58047  127.0.0.1:8088  ESTABLISHED  1234
+            if local.rsplit(":", 1)[-1] != target:
+                continue
+            if remote.rsplit(":", 1)[-1] != "8088":
+                continue
+            if not os_pid.isdigit():
+                continue
+            proc_cmd = _win_process_command_line(int(os_pid)) if _IS_WINDOWS else ""
+            friendly = _friendly_caller_name(int(os_pid), proc_cmd, "")
+            if friendly in ("未知", "8088代理自身"):
+                continue
+            name, pid, cmd = friendly, int(os_pid), proc_cmd
+            break
+    except Exception:
+        pass
+
+    # netstat 没查到时，退回 UA 识别结果
+    if name in ("未知", "") and ua_hint:
+        name = ua_hint
+    return name, pid, cmd
+
+
 def identify_caller_process(client_ip, client_port, user_agent=""):
     """通过 lsof 反查连接 8088 的客户端进程，返回友好名称和 PID
 
@@ -340,6 +395,13 @@ def identify_caller_process(client_ip, client_port, user_agent=""):
 
     # 默认值
     name, pid, cmd = "未知", 0, ""
+
+    # Windows 没有 lsof，改用 netstat -ano 反查
+    if _IS_WINDOWS:
+        name, pid, cmd = _identify_caller_windows(client_port, ua_short_circuit)
+        with _caller_name_lock:
+            _caller_name_cache[cache_key] = {"name": name, "pid": pid, "cmd": cmd, "time": now}
+        return name, pid, cmd
 
     try:
         # lsof -i :8088 查出所有连接到 8088 的进程（含客户端和服务端行）
@@ -623,8 +685,214 @@ def _format_ts_iso(ts):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
+# ============================================================
+# Windows: 读取目标进程 PEB 环境块
+# ============================================================
+# macOS 上用 `ps eww <pid>` 读进程环境；Windows 没有等价的命令行工具，
+# 这里用 ctypes 走 NtQueryInformationProcess 定位 PEB，再顺着
+# ProcessParameters 找到环境块并整体读出。纯标准库，不引入第三方依赖。
+#
+# TeleAgent 的 im-service / scheduler 子进程在启动时从父进程继承
+# SUPER_AGENT_LOCAL_SESSION_KEY，扫描这些进程即可取到。
+# （scheduler 启动后会在 JS 层 delete 掉该变量，但 Node 只删自己的副本，
+#   不会改动 Windows 进程环境块，所以 im-service 进程里仍然读得到。）
+
+if _IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes as _wt
+
+    _PROCESS_QUERY_INFORMATION = 0x0400
+    _PROCESS_VM_READ = 0x0010
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _TH32CS_SNAPPROCESS = 0x00000002
+    _MAX_PATH = 260
+
+    # RTL_USER_PROCESS_PARAMETERS 中 Environment 字段的候选偏移
+    # （随 Windows 版本/位宽略有差异，逐个探测直到读出合法环境块）
+    _PPARAM_OFFSETS = (0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+                       0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x100, 0x110, 0x120)
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", _wt.DWORD), ("cntUsage", _wt.DWORD),
+            ("th32ProcessID", _wt.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", _wt.DWORD), ("cntThreads", _wt.DWORD),
+            ("th32ParentProcessID", _wt.DWORD), ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", _wt.DWORD), ("szExeFile", _wt.WCHAR * _MAX_PATH),
+        ]
+
+    class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("ExitStatus", _wt.LONG), ("PebBaseAddress", _wt.LPVOID),
+            ("AffinityMask", ctypes.c_size_t), ("BasePriority", _wt.LONG),
+            ("UniqueProcessId", _wt.LPVOID),
+            ("InheritedFromUniqueProcessId", _wt.LPVOID),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+
+    _OpenProcess = _kernel32.OpenProcess
+    _OpenProcess.restype = _wt.HANDLE
+    _OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+
+    _ReadProcessMemory = _kernel32.ReadProcessMemory
+    _ReadProcessMemory.restype = _wt.BOOL
+    _ReadProcessMemory.argtypes = [_wt.HANDLE, _wt.LPCVOID, _wt.LPVOID,
+                                   ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+
+    _NtQueryInformationProcess = _ntdll.NtQueryInformationProcess
+    _NtQueryInformationProcess.restype = _wt.LONG
+    _NtQueryInformationProcess.argtypes = [_wt.HANDLE, ctypes.c_int, _wt.LPVOID,
+                                           _wt.ULONG, ctypes.POINTER(_wt.ULONG)]
+
+    _CloseHandle = _kernel32.CloseHandle
+    _CloseHandle.restype = _wt.BOOL
+    _CloseHandle.argtypes = [_wt.HANDLE]
+
+    _CreateToolhelp32Snapshot = _kernel32.CreateToolhelp32Snapshot
+    _CreateToolhelp32Snapshot.restype = _wt.HANDLE
+    _CreateToolhelp32Snapshot.argtypes = [_wt.DWORD, _wt.DWORD]
+
+    _Process32FirstW = _kernel32.Process32FirstW
+    _Process32FirstW.restype = _wt.BOOL
+    _Process32FirstW.argtypes = [_wt.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+
+    _Process32NextW = _kernel32.Process32NextW
+    _Process32NextW.restype = _wt.BOOL
+    _Process32NextW.argtypes = [_wt.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+
+    def _win_read_mem(handle, address, size):
+        """读取目标进程内存；越界时返回已读到的部分而不是抛错。"""
+        buf = ctypes.create_string_buffer(size)
+        read = ctypes.c_size_t(0)
+        ok = _ReadProcessMemory(handle, ctypes.c_void_p(address), buf, size, ctypes.byref(read))
+        if not ok and read.value == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buf.raw[:read.value]
+
+    def _win_read_ptr(handle, address):
+        size = ctypes.sizeof(ctypes.c_void_p)
+        raw = _win_read_mem(handle, address, size)
+        if len(raw) < size:
+            return None
+        return ctypes.c_void_p.from_buffer_copy(raw).value
+
+    def _win_list_processes():
+        """Toolhelp32 快照枚举所有进程，返回 [(pid, exeName)]。"""
+        snapshot = _CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == -1:
+            return []
+        result = []
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if _Process32FirstW(snapshot, ctypes.byref(entry)):
+                while True:
+                    result.append((int(entry.th32ProcessID), entry.szExeFile))
+                    if not _Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+        except Exception:
+            pass
+        finally:
+            _CloseHandle(snapshot)
+        return result
+
+    def _win_process_env(pid):
+        """读取目标进程的环境变量条目列表；读不到返回空列表。"""
+        handle = _OpenProcess(_PROCESS_QUERY_INFORMATION | _PROCESS_VM_READ, False, pid)
+        if not handle:
+            return []
+        try:
+            pbi = _PROCESS_BASIC_INFORMATION()
+            returned = _wt.ULONG(0)
+            status = _NtQueryInformationProcess(handle, 0, ctypes.byref(pbi),
+                                                ctypes.sizeof(pbi), ctypes.byref(returned))
+            if status != 0 or not pbi.PebBaseAddress:
+                return []
+            for peb_off in _PPARAM_OFFSETS:
+                try:
+                    params = _win_read_ptr(handle, pbi.PebBaseAddress + peb_off)
+                except Exception:
+                    continue
+                if not params:
+                    continue
+                for env_off in _PPARAM_OFFSETS:
+                    try:
+                        env_ptr = _win_read_ptr(handle, params + env_off)
+                        if not env_ptr:
+                            continue
+                        raw = _win_read_mem(handle, env_ptr, 1 << 20)
+                    except Exception:
+                        continue
+                    text = raw.decode("utf-16-le", errors="ignore")
+                    entries = []
+                    for chunk in text.split("\x00"):
+                        if chunk == "":
+                            break
+                        entries.append(chunk)
+                    # 环境块至少要有若干条且形如 KEY=VALUE
+                    if len(entries) >= 3 and any("=" in e for e in entries[:20]):
+                        return entries
+            return []
+        except Exception:
+            return []
+        finally:
+            _CloseHandle(handle)
+
+    def _win_find_session_key():
+        """扫描 TeleAgent 相关进程，取出 SUPER_AGENT_LOCAL_SESSION_KEY。"""
+        wanted = ("node.exe", "teleagent.exe")
+        for pid, name in _win_list_processes():
+            if name.lower() not in wanted:
+                continue
+            for entry in _win_process_env(pid):
+                if entry.startswith("SUPER_AGENT_LOCAL_SESSION_KEY="):
+                    value = entry.split("=", 1)[1].strip()
+                    if value:
+                        return value
+        return None
+
+    def _win_process_command_line(pid):
+        """取目标进程的完整命令行（ProcessCommandLineInformation = 60）。
+
+        返回的是一个 UNICODE_STRING 结构（长度在前、Buffer 指针在偏移 8），
+        其 Buffer 指向紧跟在结构体之后的缓冲区内容（偏移 16 处），
+        直接从返回缓冲区里取即可；若指针落在别处，再退回 ReadProcessMemory。
+        """
+        handle = _OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_VM_READ,
+                              False, pid)
+        if not handle:
+            return ""
+        try:
+            buffer = ctypes.create_string_buffer(4096)
+            size = _wt.ULONG(ctypes.sizeof(buffer))
+            status = _NtQueryInformationProcess(handle, 60, ctypes.byref(buffer),
+                                                ctypes.sizeof(buffer), ctypes.byref(size))
+            if status != 0:
+                return ""
+            # UNICODE_STRING: USHORT Length @0, USHORT MaximumLength @2, PWSTR Buffer @8
+            us_length = ctypes.cast(ctypes.byref(buffer, 0), ctypes.POINTER(ctypes.c_ushort))[0]
+            buf_ptr = ctypes.cast(ctypes.byref(buffer, 8), ctypes.POINTER(ctypes.c_void_p))[0]
+            if not us_length or us_length > 0x8000:
+                return ""
+            # 情况一：字符串就在返回缓冲区内部（常见）
+            offset = (buf_ptr or 0) - ctypes.addressof(buffer)
+            if 0 <= offset and offset + us_length <= ctypes.sizeof(buffer):
+                raw = buffer.raw[offset:offset + us_length]
+            else:
+                # 情况二：指针指向别的地址空间，用 ReadProcessMemory 读
+                raw = _win_read_mem(handle, buf_ptr, us_length)
+            return raw.decode("utf-16-le", errors="ignore").strip()
+        except Exception:
+            return ""
+        finally:
+            _CloseHandle(handle)
+
+
 def get_session_key():
-    """从运行中的 scheduler 进程获取 SUPER_AGENT_LOCAL_SESSION_KEY"""
+    """从运行中的 TeleAgent 进程获取 SUPER_AGENT_LOCAL_SESSION_KEY"""
     global _cached_session_key, _cached_session_key_time
 
     with _session_key_lock:
@@ -638,6 +906,19 @@ def get_session_key():
             _cached_session_key = key
             _cached_session_key_time = time.time()
             return key
+
+        if _IS_WINDOWS:
+            # Windows: 读取 TeleAgent 子进程 PEB 环境块（无 pgrep / ps eww）
+            try:
+                key = _win_find_session_key()
+            except Exception as e:
+                print(f"[WARN] 获取 session key 失败: {e}", file=sys.stderr)
+                key = None
+            if key:
+                _cached_session_key = key
+                _cached_session_key_time = time.time()
+                return key
+            return _cached_session_key  # 返回可能过期的缓存
 
         # 从 scheduler/im-service 进程获取
         try:
@@ -966,7 +1247,8 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
                         try:
                             header, b64data = img_url.split(",", 1)
                             img_bytes = base64.b64decode(b64data)
-                            img_path = os.path.join("/tmp/reachy_vision", f"proxy_{int(time.time()*1000)}.jpg")
+                            img_path = os.path.join(tempfile.gettempdir(), "reachy_vision",
+                                                   f"proxy_{int(time.time()*1000)}.jpg")
                             os.makedirs(os.path.dirname(img_path), exist_ok=True)
                             with open(img_path, "wb") as f:
                                 f.write(img_bytes)
@@ -1848,7 +2130,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "status": "running",
                 "uptime_seconds": uptime,
                 "uptime_human": _format_uptime(uptime),
-                "listen": f"0.0.0.0:{self.server.server_address[1]}",
+                "listen": f"{self.server.server_address[0]}:{self.server.server_address[1]}",
                 "default_model": get_default_model(),
                 "default_directory": DEFAULT_DIRECTORY,
             },
@@ -2113,6 +2395,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def _serve_console(self):
         html = CONSOLE_HTML
+        html = html.replace("__PLATFORM_LABEL__", PLATFORM_LABEL)
+        html = html.replace("__SESSION_KEY_SOURCE__", SESSION_KEY_SOURCE_LABEL)
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3257,10 +3541,10 @@ async function loadStatus() {
     document.getElementById('systemInfo').innerHTML = `
       <div class="status-row"><span class="key">代理版本</span><span class="val">v1.0</span></div>
       <div class="status-row"><span class="key">Python</span><span class="val">${'Python 3'}</span></div>
-      <div class="status-row"><span class="key">运行平台</span><span class="val">macOS (launchd)</span></div>
+      <div class="status-row"><span class="key">运行平台</span><span class="val">__PLATFORM_LABEL__</span></div>
       <div class="status-row"><span class="key">super-agent 版本</span><span class="val">${sa.version || '未知'}</span></div>
       <div class="status-row"><span class="key">签名版本</span><span class="val">local-v1 (HMAC-SHA256 + base64url)</span></div>
-      <div class="status-row"><span class="key">Session Key 来源</span><span class="val">pgrep scheduler → ps eww</span></div>
+      <div class="status-row"><span class="key">Session Key 来源</span><span class="val">__SESSION_KEY_SOURCE__</span></div>
       <div class="status-row"><span class="key">SSE 事件流</span><span class="val">/global/event</span></div>
       <div class="status-row"><span class="key">会话创建方式</span><span class="val">按 session_title 复用，无标题则新建</span></div>`;
 

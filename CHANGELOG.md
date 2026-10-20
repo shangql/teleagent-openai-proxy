@@ -14,6 +14,27 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.10.0] - 2026-10-20
+
+### 新增
+
+- **Windows 平台支持**：此前仅支持 macOS，Windows 上无法启动（`pgrep` / `ps eww` 不存在）。本次完成适配并在 Windows 实机验证通过
+  - **session key 提取（核心）**：macOS 用 `pgrep` + `ps eww` 读进程环境，Windows 无等价命令，改为遍历 `node.exe` / `TeleAgent.exe` 并直接读取目标进程的 PEB 环境块
+    - 实现：纯标准库 ctypes——`CreateToolhelp32Snapshot` 枚举进程 → `NtQueryInformationProcess(ProcessBasicInformation)` 定位 PEB → 探测 `RTL_USER_PROCESS_PARAMETERS` 中 `Environment` 偏移 → `ReadProcessMemory` 读出 UTF-16LE 环境块 → 匹配 `SUPER_AGENT_LOCAL_SESSION_KEY=`；**无需管理员权限、无第三方依赖**
+    - 关键发现：scheduler 源码中 `delete process.env[SESSION_KEY_ENV]` 在 Windows 上会真正 unset 掉 PEB 环境块里的变量（macOS 的 `ps eww` 读的是启动时快照，不受影响），因此 key 实际由 **im-service 进程**持有，而非 scheduler。实现按"扫描所有候选进程"而非硬编码 PID，TeleAgent 升级后仍可自适应
+  - **调用方反查**：新增 `netstat -ano` 版实现替代 macOS 的 `lsof -i :8088`；配套 `_win_process_command_line()`（`ProcessCommandLineInformation`）取目标进程完整命令行
+  - **启动脚本**：`start_proxy.cmd`——自动挑选可用解释器（优先 TeleAgent 自带 Python 3.12 运行时，其次系统 PATH 上的 python），启动前检查 4397 端口是否有 super-agent 在监听；文件为纯 ASCII，兼容任意 Windows 控制台代码页
+  - **持久化**：`install-scheduled-task.ps1`——用「任务计划程序」替代 launchd plist（用户登录时自启 + 失败自动重启），支持 `-Uninstall` 卸载
+  - **README**：新增「Windows 启动」「持久化运行（Windows 任务计划程序）」章节，签名机制章节补充 Windows 取 key 的实现说明
+- **多平台静态常量**：`PLATFORM_LABEL` / `SESSION_KEY_SOURCE_LABEL`，控制台「运行平台」「Session Key 来源」按平台动态渲染，不再硬编码 macOS 文案
+
+### 修复
+
+- **多模态图片临时目录硬编码 `/tmp/reachy_vision`**：Windows 上会解析到当前盘符根目录，改为 `tempfile.gettempdir()`（macOS 行为不变）
+- **`/api/status` 的 `listen` 字段硬编码 `0.0.0.0`**：无论实际绑定什么地址都显示 `0.0.0.0`，改为输出真实绑定地址——在只监听 `127.0.0.1` 时也能准确反映，避免误判代理的暴露范围
+
+> macOS 行为保持不变，原有 `pgrep` + `ps eww` 取 key 路径原样保留。
+
 ## [1.9.10] - 2026-09-27
 
 ### 修复

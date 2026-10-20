@@ -34,11 +34,34 @@ AIGC:
 
 > **TCC 权限提示**：macOS 的 `~/Desktop`、`~/Documents`、`~/Downloads` 受 TCC 隐私保护。通过 `launchd` 持久化运行的服务需要使用已获得 TCC 授权的 Python 解释器（如 Homebrew 安装的 Python 3.11+），否则会遇到 `Operation not permitted` 错误。如果脚本放在 `/tmp` 或 `~/scripts` 等非受保护目录，则无此限制。
 
+> **Windows 说明**：Windows 已适配可用。`session key` 的获取方式在两个平台上不同——macOS 用 `pgrep` + `ps eww` 读进程环境，Windows 没有等价命令，改为直接读取 TeleAgent 子进程的 PEB 环境块（纯标准库 ctypes 实现，无需管理员权限）。其余 HTTP / HMAC / SSE 逻辑完全一致。详见下方「Windows 启动」。
+
 ### 启动代理
 
 ```bash
 python3 openai_proxy.py --port 8088 --host 0.0.0.0
 ```
+
+### Windows 启动
+
+```bat
+:: 双击或命令行执行，会自动挑选可用的 Python 解释器
+start_proxy.cmd
+```
+
+手动指定解释器与监听地址：
+
+```bat
+:: 优先使用 TeleAgent 自带的 Python 运行时（无需安装 Python）
+"%USERPROFILE%\.local\share\TeleAgent\runtimes\python\python.exe" openai_proxy.py --host 127.0.0.1 --port 8088
+```
+
+Windows 上的注意事项：
+
+- **监听地址**：建议用 `--host 127.0.0.1`。代理**不校验 API Key**，用 `0.0.0.0` 会把本机 TeleAgent 的调用能力暴露给整个局域网。
+- **前置依赖**：TeleAgent 桌面应用必须已启动（super-agent 监听 `127.0.0.1:4397`），否则拿不到 session key，代理会在启动阶段直接报错退出。
+- **Python**：不强制安装。TeleAgent 自带 Python 3.12 运行时，`start_proxy.cmd` 会优先使用它；也可用系统 Python 3.8+。
+- **持久化**：用任务计划程序替代 launchd，见下方「持久化运行（Windows 任务计划程序）」。
 
 ### 调用示例
 
@@ -103,6 +126,25 @@ print(resp.choices[0].message.content)
 - **会话管理**：查看 super-agent 创建的会话列表
 - **系统信息**：版本、签名机制、API 端点文档
 - **使用说明**：内置完整使用文档，含代码示例和一键复制
+
+## 持久化运行（Windows 任务计划程序）
+
+Windows 上用「任务计划程序」替代 launchd，实现用户登录时自启 + 崩溃自动重启：
+
+```powershell
+# 注册计划任务（默认只监听 127.0.0.1:8088）
+powershell -ExecutionPolicy Bypass -File install-scheduled-task.ps1
+
+# 立即启动 / 停止 / 查看
+Start-ScheduledTask -TaskName "TeleAgent OpenAI Proxy"
+Stop-ScheduledTask  -TaskName "TeleAgent OpenAI Proxy"
+Get-ScheduledTask  -TaskName "TeleAgent OpenAI Proxy" | Get-ScheduledTaskInfo
+
+# 卸载
+powershell -ExecutionPolicy Bypass -File install-scheduled-task.ps1 -Uninstall
+```
+
+> 任务在**用户登录时**触发（与 TeleAgent 桌面应用的启动时机一致），日志写入 `%LOCALAPPDATA%\TeleAgentOpenAIProxy\`。
 
 ## 持久化运行（macOS launchd）
 
@@ -170,6 +212,8 @@ launchctl load ~/Library/LaunchAgents/com.lizhun.openai-proxy.plist
 ### 签名机制
 
 代理自动从 scheduler 进程环境变量中提取 `SUPER_AGENT_LOCAL_SESSION_KEY`，使用 HMAC-SHA256 + base64url 生成签名头：
+
+> macOS 通过 `pgrep` + `ps eww` 读取进程环境；Windows 改为遍历 `node.exe` / `TeleAgent.exe` 并直接读取目标进程的 PEB 环境块（`NtQueryInformationProcess` + `ReadProcessMemory`，纯 ctypes 标准库实现，无需管理员权限）。
 
 ```
 payload = "\n".join(["local-v1", method, path_with_query, timestamp_ms, nonce])
