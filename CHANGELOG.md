@@ -14,6 +14,23 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.13.0] - 2026-10-20
+
+### 新增
+
+- **README 补充「接入 dsh（DeepSeek Harness）」章节**：把 dsh 接入本代理的完整配置落成文档，避免每人重新摸索
+  - 配置文件位置：`%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml`，`web` 与 `headless` 两个 profile 各一份，两份都要写
+  - `llm-pi-ai` 的 `providers` 下新增 `teleagent-proxy` provider（`baseURL: http://127.0.0.1:8088/v1`），并列全星小辰 5 档：`chat-flagship` / `chat-flash` / `chat-pro`（上下文 934465、输出 65536），`chat-lite` / `chat-nano`（上下文 92350、输出 16384）。上下文取 super-agent 的 `safeContextLimit`（已扣除其自身 system prompt 开销），输出取 `limit.output`
+  - 五档能力一致：仅文本输入输出、支持 tool call、不支持 `temperature` 调节与 reasoning，故**不声明** `reasoningEfforts`
+  - `agent-default-model` 切到 `provider: teleagent-proxy` / `model: NewApi/chat-pro`
+  - **环境变量坑**：dsh 的 `apiKeyEnv` 解析的是**进程环境变量**，不读 `~/.dsh/.credentials.yaml` 的 `refs:` 段，Key 必须设成用户级环境变量才生效
+  - **补丁文件坑**：同一映射里出现重复的 `models:` 键时，dsh 把后一个当成新键，前一个模型列表随之丢失（合成配置里一个模型都不剩）；`web` profile 的 `ui-theme` 与 `permission` 两段属顶层条目，不可写进 `llm-pi-ai` 的 `config` 内
+  - 验证命令：`dsh --profile web --dump-config`（合成配置应含 5 个 NewApi 模型）与 `dsh --profile headless "只回复四个字：代理链路通"`
+
+### 变更
+
+- `VERSION` 同步至 1.13.0
+
 ## [1.12.0] - 2026-10-20
 
 ### 新增

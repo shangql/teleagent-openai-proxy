@@ -137,6 +137,90 @@ print(resp.choices[0].message.content)
 
 已验证可接入：OpenAI Python SDK、LangChain、Cursor、Continue、ChatBox、NextChat 等。
 
+### 接入 dsh（DeepSeek Harness）
+
+dsh 的每个 profile 有一层独立补丁，代理配置写在这里：
+`%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml`（`web` 与 `headless` 各一份，两份都要写，否则只有其中一个 profile 能用）。
+
+**1) 在 `llm-pi-ai` 的 `providers` 下新增本机代理，并列全星小辰 5 档：**
+
+```yaml
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      teleagent-proxy:
+        displayName: TeleAgent 本地代理
+        apiKeyEnv: TELEAGENT_PROXY_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8088/v1
+        models:
+          - id: NewApi/chat-flagship
+            name: 星小辰 chat-flagship（旗舰）
+            description: 星小辰 旗舰 档，934465 上下文 / 65536 输出
+            contextWindow: 934465
+            maxTokens: 65536
+            input:
+              - text
+          - id: NewApi/chat-flash
+            name: 星小辰 chat-flash（极速）
+            description: 星小辰 极速 档，934465 上下文 / 65536 输出
+            contextWindow: 934465
+            maxTokens: 65536
+            input:
+              - text
+          - id: NewApi/chat-pro
+            name: 星小辰 chat-pro（智能）
+            description: 星小辰 智能 档，934465 上下文 / 65536 输出
+            contextWindow: 934465
+            maxTokens: 65536
+            input:
+              - text
+          - id: NewApi/chat-lite
+            name: 星小辰 chat-lite（轻量）
+            description: 星小辰 轻量 档，92350 上下文 / 16384 输出
+            contextWindow: 92350
+            maxTokens: 16384
+            input:
+              - text
+          - id: NewApi/chat-nano
+            name: 星小辰 chat-nano（轻速）
+            description: 星小辰 轻速 档，92350 上下文 / 16384 输出
+            contextWindow: 92350
+            maxTokens: 16384
+            input:
+              - text
+```
+
+上下文取 super-agent 提供的 `safeContextLimit`（已扣除其自身 system prompt 开销，即实际可用窗口），最大输出取 `limit.output`。五档都只支持文本输入输出与 tool call，不支持 `temperature` 调节与 reasoning，因此**不要**声明 `reasoningEfforts`。
+
+**2) 把默认模型切到代理：**
+
+```yaml
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: teleagent-proxy
+    model: NewApi/chat-pro
+```
+
+**3) 设用户级环境变量：**
+
+dsh 的 `apiKeyEnv` 解析的是**进程环境变量**，不读 `~/.dsh/.credentials.yaml` 的 `refs:` 段，所以 Key 必须落到用户级环境变量里（代理默认 `auth=off`，填 `any` 即可；切到 `strict` 后换成控制台「认证」面板生成的 `tap-` 开头 Key）：
+
+```powershell
+[Environment]::SetEnvironmentVariable('TELEAGENT_PROXY_API_KEY', 'any', 'User')
+```
+
+**4) 验证：**
+
+```powershell
+dsh --profile web --dump-config        # 合成配置里应能看到 5 个 NewApi 模型
+dsh --profile headless "只回复四个字：代理链路通"
+```
+
+> 改补丁文件时注意两点：一是同一个映射里**不能出现重复的 `models:` 键**，dsh 会把后一个当成新键，前一个模型列表随之丢失（合成配置里一个模型都不剩）；二是 `web` profile 里 `ui-theme` 与 `permission` 两段属于顶层条目，不要写进 `llm-pi-ai` 的 `config` 里。
+
 ## 认证（API Key）
 
 控制台的「认证」面板可随时开关并管理 API Key，改动即时生效，无需重启。
