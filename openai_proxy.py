@@ -3365,9 +3365,40 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             # 正文照常增量发出，标记由 splitter 负责剥离
             for kind, payload in splitter.feed(text):
                 if kind == "text":
-                    _emit_content(payload)
+                    _smooth_emit(payload)
                 else:
                     _emit_tool_calls(payload)
+
+        # ---- 打字机平滑（typewriter smoothing）----
+        # 实测：上游 TeleAgent 会话服务在整个回合生成完毕后，才把全部增量
+        # 批量推给代理（约 100 字内容在 0.4 秒内倾泻而下），代理虽然逐块
+        # flush，客户端体感仍是一次性输出。这里把倾泻下来的文本按自适应
+        # 节奏匀速下发，还原真实流式体感：
+        #   - 单块超过 16 字时切成 ≤16 字的小片
+        #   - 片间隔 = 片长 / (30 + 已输出字数) 秒：短回复约 30-60 字/秒的
+        #     打字机效果；长回复自动加速，总平滑耗时按对数增长（约 4-5 秒封顶）
+        #   - 若上游将来变为真实细粒度实时推送（到达慢于本节奏），节拍器
+        #     天然无等待，不会引入任何额外延迟
+        _tw_state = {"next_t": None, "n": 0}
+
+        def _smooth_emit(text):
+            if not text:
+                return
+            if len(text) <= 16:
+                pieces = [text]
+            else:
+                pieces = [text[i:i + 16] for i in range(0, len(text), 16)]
+            for piece in pieces:
+                now = time.time()
+                if _tw_state["next_t"] is None:
+                    _tw_state["next_t"] = now
+                wait = _tw_state["next_t"] - now
+                if wait > 0:
+                    time.sleep(wait)
+                _emit_content(piece)
+                _tw_state["n"] += len(piece)
+                _tw_state["next_t"] = max(time.time(), _tw_state["next_t"]) \
+                    + len(piece) / (30.0 + _tw_state["n"])
 
         def send_complete():
             nonlocal collected_tokens, first_chunk_sent
