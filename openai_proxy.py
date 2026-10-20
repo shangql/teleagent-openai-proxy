@@ -1361,6 +1361,82 @@ def _parse_tool_calls_from_text(text):
     return clean_text, tool_calls
 
 
+class _StreamingTextSplitter:
+    """流式转发时把 [TOOL_CALL] 标记从正文里剥出来，同时保持正文增量输出。
+
+    super-agent 不发原生 tool_calls，而是把工具调用写成正文里的
+    `[TOOL_CALL]{...}[/TOOL_CALL]` 标记，代理解析后转成 OpenAI tool_calls。
+
+    旧实现为了拿到完整标记，在请求带 tools 时把整段正文缓冲到结束再解析，
+    代价是带 tools 的请求彻底失去流式体感——实测一句 89 字的回复只落成
+    1 个 SSE 事件，客户端要等模型全部说完才看到第一个字。而 dsh 一定会带
+    tools，所以这条路径覆盖了全部实际流量。
+
+    这里改成「尾部压住」：正文照常增量发出，只压住末尾少量可能被标记前缀
+    占用的字符；完整标记一到齐就立刻剥离并转成 tool_calls delta。
+
+    事件格式：("text", str) 表示可以直接发出去的正文增量，
+    ("tool_calls", list) 表示一组 OpenAI 格式的 tool_calls。
+    """
+
+    _MARKER_OPEN = "[TOOL_CALL]"
+    _MARKER_CLOSE = "[/TOOL_CALL]"
+    # 标记前缀可能被拆到相邻两个增量块里，压住这么多个字符就不会漏判
+    _HOLD = len(_MARKER_OPEN) - 1
+    _MARKER_RE = re.compile(r"\[TOOL_CALL\].*?\[/TOOL_CALL\]", re.DOTALL)
+
+    def __init__(self):
+        self._pending = ""
+        self._call_seq = 0
+
+    def feed(self, text):
+        """吃进一段正文增量，吐出可以立刻发出去的事件列表。"""
+        if not text:
+            return []
+        self._pending += text
+        events = []
+        while True:
+            m = self._MARKER_RE.search(self._pending)
+            if m:
+                # 完整标记到齐：先把标记之前的正文发出去，再把标记转成 tool_calls
+                if m.start() > 0:
+                    events.append(("text", self._pending[:m.start()]))
+                marker = m.group(0)
+                _, tool_calls = _parse_tool_calls_from_text(marker)
+                if tool_calls:
+                    for tc in tool_calls:
+                        tc["id"] = f"call_{self._call_seq}"
+                        self._call_seq += 1
+                    events.append(("tool_calls", tool_calls))
+                else:
+                    # 标记内容不合法：原样回显（与旧实现一致）
+                    events.append(("text", marker))
+                self._pending = self._pending[m.end():]
+                continue
+
+            start = self._pending.find(self._MARKER_OPEN)
+            if start != -1:
+                # 标记已开始但还没收尾：标记之前的正文照发，标记整体压住
+                if start > 0:
+                    events.append(("text", self._pending[:start]))
+                self._pending = self._pending[start:]
+                break
+
+            if len(self._pending) > self._HOLD:
+                events.append(("text", self._pending[:-self._HOLD]))
+                self._pending = self._pending[-self._HOLD:]
+            break
+        return events
+
+    def flush(self):
+        """流结束时把压住的尾巴交出去（残缺标记原样回显，与旧实现一致）。"""
+        if not self._pending:
+            return []
+        pending = self._pending
+        self._pending = ""
+        return [("text", pending)]
+
+
 # ============================================================
 # Super-Agent API 客户端
 # ============================================================
@@ -3226,9 +3302,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         stream_options = stream_options or {}
 
         # Tool call 检测状态
-        # 当 tools 参数存在时，始终缓冲完整响应再解析（LLM 可能在 tool call 前加对话文字）
-        _has_tools = bool(tools)
-        _buffer = []                  # 缓冲的文本片段
+        # super-agent 不发原生 tool_calls，而是把工具调用写成正文里的
+        # [TOOL_CALL]{...}[/TOOL_CALL] 标记，所以带 tools 的请求也得把标记从
+        # 正文里剥出来。旧实现是「整段缓冲到结束再解析」，代价是带 tools 的
+        # 请求完全没有流式体感（实测一句 89 字的回复只落成 1 个 SSE 事件），
+        # 而 dsh 一定带 tools，这条路径覆盖了全部实际流量。
+        # 现在改成尾部压住：正文照常增量发出，只压住末尾可能被标记前缀占用的
+        # 少量字符；完整标记一到齐立刻剥离并转成 tool_calls delta。
+        splitter = _StreamingTextSplitter()
+        _tool_call_count = 0          # 已发出的 tool_calls 个数，兼作 delta index
 
         def _emit_content(text):
             """发送 content delta"""
@@ -3250,99 +3332,92 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 }
                 self._send_sse_chunk(chunk)
 
+        def _emit_tool_calls(tool_calls):
+            """发送 tool_calls delta（index 跨整个响应连续编号）"""
+            nonlocal first_chunk_sent, _tool_call_count
+            if not first_chunk_sent:
+                first_chunk = {
+                    "id": request_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+                }
+                self._send_sse_chunk(first_chunk)
+                first_chunk_sent = True
+            for tc in tool_calls:
+                chunk = {
+                    "id": request_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {
+                        "tool_calls": [{
+                            "index": _tool_call_count,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": tc["function"]
+                        }]
+                    }, "finish_reason": None}]
+                }
+                self._send_sse_chunk(chunk)
+                _tool_call_count += 1
+
         def send_delta(text):
             if not text:
                 return
-
-            if _has_tools:
-                # 有 tools 时始终缓冲，等完整响应再解析
-                _buffer.append(text)
-                return
-
-            # 无 tools 时正常流式
-            _emit_content(text)
+            # 正文照常增量发出，标记由 splitter 负责剥离
+            for kind, payload in splitter.feed(text):
+                if kind == "text":
+                    _emit_content(payload)
+                else:
+                    _emit_tool_calls(payload)
 
         def send_complete():
             nonlocal collected_tokens, first_chunk_sent
 
-            # 有 tools 时：缓冲了完整响应，现在解析
-            if _has_tools and _buffer:
-                full_text = "".join(_buffer)
-                clean_text, tool_calls = _parse_tool_calls_from_text(full_text)
+            # 收尾：把压住的尾巴交出去（残缺标记原样回显，与旧实现一致）
+            for kind, payload in splitter.flush():
+                if kind == "text":
+                    _emit_content(payload)
+                else:
+                    _emit_tool_calls(payload)
 
-                if tool_calls:
-                    # 先发送 tool_call 前的对话文本（如"好，我看看哦~"）
-                    # _parse_tool_calls_from_text 返回的 clean_text 是去掉 [TOOL_CALL] 标记后的剩余文本
-                    if clean_text and clean_text.strip():
-                        if not first_chunk_sent:
-                            first_chunk = {
-                                "id": request_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model_name,
-                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-                            }
-                            self._send_sse_chunk(first_chunk)
-                            first_chunk_sent = True
-                        content_chunk = {
-                            "id": request_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": {"content": clean_text}, "finish_reason": None}]
-                        }
-                        self._send_sse_chunk(content_chunk)
-                    # 然后发送 tool_calls delta
-                    if not first_chunk_sent:
-                        first_chunk = {
-                            "id": request_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-                        }
-                        self._send_sse_chunk(first_chunk)
-                        first_chunk_sent = True
-                    for i, tc in enumerate(tool_calls):
-                        chunk = {
-                            "id": request_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [{"index": 0, "delta": {
-                                "tool_calls": [{
-                                    "index": i,
-                                    "id": tc["id"],
-                                    "type": "function",
-                                    "function": tc["function"]
-                                }]
-                            }, "finish_reason": None}]
-                        }
-                        self._send_sse_chunk(chunk)
-                    end_chunk = {
+            if _tool_call_count > 0:
+                # 本轮出现过工具调用：finish_reason = tool_calls
+                # （正文已在流式过程中增量发出，tool_calls delta 紧随其后）
+                if not first_chunk_sent:
+                    first_chunk = {
                         "id": request_id, "object": "chat.completion.chunk",
                         "created": created, "model": model_name,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
                     }
-                    self._send_sse_chunk(end_chunk)
-                    # usage chunk
-                    if stream_options.get("include_usage"):
-                        listener_tokens = getattr(listener, 'tokens', None) or {}
-                        usage = {
-                            "prompt_tokens": listener_tokens.get("input", 0),
-                            "completion_tokens": listener_tokens.get("output", 0),
-                            "total_tokens": listener_tokens.get("total",
-                                                               listener_tokens.get("input", 0) + listener_tokens.get("output", 0)),
-                        }
-                        usage_chunk = {
-                            "id": request_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model_name,
-                            "choices": [], "usage": usage,
-                        }
-                        self._send_sse_chunk(usage_chunk)
-                    self._send_sse_end()
-                    log_entry["status"] = "success"
-                    log_entry["response_preview"] = f"[tool_calls: {len(tool_calls)}]"
-                    log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
-                    update_stats(model=model_name, streaming=True)
-                    log_request_to_disk(log_entry)
-                    return
-                else:
-                    # 没有检测到 tool calls，把缓冲文本作为正常 content 发送
-                    _emit_content(clean_text or full_text)
-                    _buffer.clear()
+                    self._send_sse_chunk(first_chunk)
+                    first_chunk_sent = True
+                end_chunk = {
+                    "id": request_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                }
+                self._send_sse_chunk(end_chunk)
+                # usage chunk
+                if stream_options.get("include_usage"):
+                    listener_tokens = getattr(listener, 'tokens', None) or {}
+                    usage = {
+                        "prompt_tokens": listener_tokens.get("input", 0),
+                        "completion_tokens": listener_tokens.get("output", 0),
+                        "total_tokens": listener_tokens.get("total",
+                                                           listener_tokens.get("input", 0) + listener_tokens.get("output", 0)),
+                    }
+                    usage_chunk = {
+                        "id": request_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [], "usage": usage,
+                    }
+                    self._send_sse_chunk(usage_chunk)
+                self._send_sse_end()
+                log_entry["status"] = "success"
+                log_entry["response_preview"] = f"[tool_calls: {_tool_call_count}]"
+                log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
+                update_stats(model=model_name, streaming=True)
+                log_request_to_disk(log_entry)
+                return
 
             # 正常完成
             if not first_chunk_sent:

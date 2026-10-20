@@ -14,6 +14,25 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.14.0] - 2026-10-21
+
+### 修复
+
+- **带 `tools` 的请求没有流式体感**：早期实现为了拿到完整的 `[TOOL_CALL]...[/TOOL_CALL]` 标记，只要请求带 `tools` 就把整段正文缓冲到结束再解析。实测一句 89 字的回复只落成 **1 个 SSE 事件**，客户端要等模型全部说完才看到第一个字。而 dsh 一定会带 `tools`，这条路径覆盖了全部实际流量——「用 dsh 发消息，没有流式输出」，就是这个原因
+  - 新增 `_StreamingTextSplitter`：正文照常增量下发，只压住末尾 `len("[TOOL_CALL]") - 1` 个可能被标记前缀占用的字符；完整标记一到齐立刻剥离并转成 `tool_calls` delta
+  - 标记被拆到相邻增量块里也能识别（逐个偏移量有测试覆盖），不会泄漏到正文
+  - 同一提示词（1403 字长回复）实测：带 `tools` 从 **1 块** 变为 **198 块**，首末块间隔占全程 59%；与不带 `tools` 的 348 块处于同一量级
+  - 语义保持：`finish_reason` 仍是 `tool_calls`，正文在增量过程中先发出，`tool_calls` delta 紧随其后，`index` 跨整个响应连续编号；非法/残缺标记仍按旧实现原样回显
+
+### 新增
+
+- **单元测试**（`tests/test_streaming_splitter.py`）：19 个用例覆盖增量拼接无损、标记剥离、跨块标记、多标记编号、非法标记回显、切块方式无关性，以及与旧全量解析器的结果一致性。全套 56 个用例通过（`python -m unittest discover -s tests`）
+- **README 新增「流式转发」小节**：说明带 `tools` 时的缓冲取舍与修复后的实测对比表
+
+### 变更
+
+- `VERSION` 同步至 1.14.0
+
 ## [1.13.0] - 2026-10-20
 
 ### 新增
