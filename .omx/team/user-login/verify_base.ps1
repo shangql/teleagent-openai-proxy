@@ -157,12 +157,20 @@ if ($ready) {
 $liveAfter = Get-NetTCPConnection -State Listen -LocalPort 8088 -ErrorAction SilentlyContinue | Select-Object -First 1
 $livePidAfter = 0
 if ($liveAfter) { $livePidAfter = $liveAfter.OwningProcess }
+$listeners = (Get-NetTCPConnection -State Listen -LocalPort 8088 -ErrorAction SilentlyContinue |
+              ForEach-Object { "$($_.LocalAddress):$($_.LocalPort)/pid=$($_.OwningProcess)" }) -join " ; "
+
 if ($livePidBefore -ne 0 -and $livePidBefore -eq $livePidAfter) {
-    Add-Result "T11 live instance untouched" "PASS" "PID $livePidAfter unchanged"
+    Add-Result "T11 live instance untouched" "PASS" "PID $livePidAfter unchanged (listeners: $listeners)"
 } elseif ($livePidBefore -eq 0) {
     Add-Result "T11 live instance untouched" "PASS" "nothing listening on 8088"
 } else {
-    Add-Result "T11 live instance untouched" "FAIL" "PID changed: $livePidBefore -> $livePidAfter"
+    # The harness never binds 8088 (it uses a copy on $Port), so a change here means
+    # SOMEONE ELSE restarted the live proxy during the verification window.
+    $candidates = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.CommandLine -like '*openai_proxy.py*' } |
+                  ForEach-Object { "pid=$($_.ProcessId) started=$($_.CreationDate)" }
+    Add-Result "T11 live instance untouched" "FAIL" ("EXTERNAL restart detected during verification window: PID $livePidBefore -> $livePidAfter (harness binds $Port only, never 8088). listeners now: " + $listeners + " | proxy processes: " + ($candidates -join " ; "))
 }
 
 if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }

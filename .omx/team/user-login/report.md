@@ -61,6 +61,7 @@
 | # | 事实 | 证据 |
 | --- | --- | --- |
 | D-1 | **同时有两个代理实例在监听 8088**：`PID 25756`→`127.0.0.1`（计划任务拉起）、`PID 26124`→`0.0.0.0`（**局域网可达**） | `Get-NetTCPConnection -LocalPort 8088` |
+| D-1b | **22:43 实测更新**：`127.0.0.1:8088` 的持有者已由 `PID 25756`（22:22:49 启动）变成 `PID 8780`（22:42:18 启动，启动参数相同）；`0.0.0.0:8088` 仍是 `PID 26124`。即**线上实例在本次会话期间被外部重启过**。验证闸门的 T11 断言因此真实报出过一次 FAIL（`PID changed: 25756 -> 8780`），已定位为**外部行为**：闸门只用副本目录 + 18089/18091/18093 端口，从不绑定 8088 | `Get-CimInstance Win32_Process` 的 `CreationDate` + 闸门日志 | 上线窗口前必须确认"当前服务进程是谁、有没有别人正在重启"；闸门 T11 已改为在报出变化时附上监听拓扑与全部代理进程，避免把外部重启误判成测试副作用 |
 | D-2 | 计划任务 `TeleAgent OpenAI Proxy` = `Ready`，runner 指向**本仓库** `openai_proxy.py --host 127.0.0.1 --port 8088` | `%LOCALAPPDATA%\TeleAgentOpenAIProxy\run-proxy.cmd` |
 | D-3 | `required` 对**整个局域网**生效（因为存在 `0.0.0.0` 实例） | 同上 |
 | D-4 | 回滚 = `python user_auth.py --set-mode off`（分钟级，不需重启） | `user_auth.py` CLI |
